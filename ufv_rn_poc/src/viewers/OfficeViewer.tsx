@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -13,11 +13,9 @@ import {
   Image,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
-import { NativeModules } from 'react-native';
 import { ArchiveEngine } from '../services/ArchiveEngine';
 import { MMKV } from '../services/MMKV';
 
-const { ArchiveModule } = NativeModules;
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 interface OfficeViewerProps {
@@ -27,12 +25,72 @@ interface OfficeViewerProps {
   onClose: () => void;
 }
 
-interface SlideData {
+// Phase 1 / Phase 2 PPTX Schema
+interface PptxElement {
+  type: 'text' | 'shape' | 'image' | 'table' | 'unsupported';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+  geometry?: string;
+  anchor?: 'top' | 'middle' | 'bottom';
+  fill?: {
+    type: 'solid' | 'gradient' | 'none';
+    color?: string;
+    stops?: { pos: number; color: string }[];
+    angle?: number;
+  };
+  line?: {
+    width?: number;
+    color?: string;
+  };
+  autofit?: {
+    fontScale?: number;
+    lnSpcReduction?: number;
+  };
+  paragraphs?: {
+    align?: 'left' | 'center' | 'right' | 'justify';
+    bullet?: string | null;
+    level?: number;
+    runs: {
+      text: string;
+      sizePt?: number;
+      bold?: boolean;
+      italic?: boolean;
+      underline?: boolean;
+      color?: string;
+      font?: string;
+    }[];
+  }[];
+  imageUri?: string;
+  crop?: { left: number; top: number; right: number; bottom: number };
+  table?: { rows: { text: string; fill: string }[][] };
+  kind?: string;
+}
+
+interface PptxSlideData {
+  index: number;
+  width: number;
+  height: number;
+  aspectRatio: number;
+  background: {
+    type: 'solid' | 'gradient' | 'image';
+    color?: string;
+    stops?: { pos: number; color: string }[];
+    angle?: number;
+    imageUri?: string;
+  };
+  elements: PptxElement[];
+}
+
+interface LegacySlideData {
   slideNumber: number;
   title: string;
   bullets: string[];
   imageUris?: string[];
-  rawText?: string[];
 }
 
 export const OfficeViewer: React.FC<OfficeViewerProps> = ({
@@ -45,15 +103,27 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [base64Content, setBase64Content] = useState<string>('');
 
-  // PPTX Slide states
-  const [slides, setSlides] = useState<SlideData[]>([]);
-  const [currentSlideIndex, setCurrentSlideIndex] = useState<number>(0);
+  // PPTX Presentation States
   const [slideCount, setSlideCount] = useState<number>(1);
+  const [slideAspectRatio, setSlideAspectRatio] = useState<number>(16 / 9);
+  const [slideWidthEMU, setSlideWidthEMU] = useState<number>(12192000);
+  const [currentSlideIndex, setCurrentSlideIndex] = useState<number>(0);
   const [isLandscape, setIsLandscape] = useState<boolean>(false);
-  const flatListRef = useRef<FlatList<SlideData>>(null);
+  const [viewMode, setViewMode] = useState<'deck' | 'cards'>('deck');
+  const [zoomLevel, setZoomLevel] = useState<number>(1.0);
+
+  // Cached parsed slides
+  const [pptxSlides, setPptxSlides] = useState<Record<number, PptxSlideData>>({});
+  const [legacySlides, setLegacySlides] = useState<LegacySlideData[]>([]);
+  const flatListRef = useRef<FlatList<any>>(null);
+  const thumbnailListRef = useRef<FlatList<any>>(null);
+  const webViewRef = useRef<WebView>(null);
+
+  // Word DOCX display states
+  const [docFontScale, setDocFontScale] = useState<number>(1.0);
+  const [docViewMode, setDocViewMode] = useState<'a4' | 'reading'>('a4');
 
   const engine = ArchiveEngine.getInstance();
-
   const isLegacy = formatType === 'DOC' || formatType === 'PPT';
   const isDocx = formatType === 'DOCX';
   const isPptx = formatType === 'PPTX';
@@ -79,99 +149,98 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     }
   };
 
-  // --- High-Performance Native PPTX Parser ---
-  const loadPptxSlides = async () => {
+  // Fetch individual slide with prefetching
+  const fetchSlide = useCallback(
+    async (index: number) => {
+      if (pptxSlides[index]) return;
+      try {
+        const slide = await engine.getPptxSlide(filePath, index);
+        if (slide) {
+          setPptxSlides((prev) => ({ ...prev, [index]: slide as unknown as PptxSlideData }));
+        }
+      } catch (err) {
+        console.warn(`Error loading slide ${index + 1}:`, err);
+      }
+    },
+    [filePath, pptxSlides]
+  );
+
+  // Pre-fetch adjacent slides
+  useEffect(() => {
+    if (!isPptx || slideCount <= 0) return;
+    fetchSlide(currentSlideIndex);
+    if (currentSlideIndex + 1 < slideCount) {
+      fetchSlide(currentSlideIndex + 1);
+    }
+    if (currentSlideIndex - 1 >= 0) {
+      fetchSlide(currentSlideIndex - 1);
+    }
+  }, [isPptx, currentSlideIndex, slideCount, fetchSlide]);
+
+  // Load Presentation Metadata and Initial Slides
+  const loadPptxPresentation = async () => {
     setIsLoading(true);
     setErrorMsg(null);
 
     try {
-      // 1. High-Performance Native Kotlin Parser
-      const res = await engine.parsePptxSlides(filePath);
-      if (res && res.slides && res.slides.length > 0) {
-        setSlides(res.slides);
-        setSlideCount(res.slides.length);
+      // 1. Get Presentation Metadata (fast OpenXML header check)
+      const meta = await engine.getPptxMeta(filePath);
+      const count = meta.slideCount > 0 ? meta.slideCount : 1;
+      const aspect = meta.aspectRatio > 0 ? meta.aspectRatio : 16 / 9;
+      setSlideCount(count);
+      setSlideAspectRatio(aspect);
+      if (meta.widthEMU) setSlideWidthEMU(meta.widthEMU);
 
-        // Restore last read position
-        const lastPos = MMKV.getPosition(filePath);
-        if (lastPos?.slide && lastPos.slide > 0 && lastPos.slide <= res.slides.length) {
-          const target = lastPos.slide - 1;
-          setCurrentSlideIndex(target);
-          setTimeout(() => {
-            flatListRef.current?.scrollToIndex({ index: target, animated: false });
-          }, 80);
-        }
-        setIsLoading(false);
-        return;
-      }
-    } catch (nativeErr) {
-      console.warn('Native PPTX parser notice, falling back to entry reader:', nativeErr);
-    }
-
-    // 2. Fallback XML Reader
-    const parsedSlides: SlideData[] = [];
-    try {
-      for (let i = 1; i <= 60; i++) {
-        try {
-          const entryPath = `ppt/slides/slide${i}.xml`;
-          const res = await ArchiveModule.readZipEntryText(filePath, entryPath);
-          const xml = res.content || '';
-
-          if (!xml) {
-            if (i > 1) break;
-            continue;
-          }
-
-          const paraMatches = xml.match(/<a:p[^>]*>(.*?)<\/a:p>/gs);
-          const allText: string[] = [];
-          let slideTitle = '';
-          const slideBullets: string[] = [];
-
-          if (paraMatches) {
-            for (const para of paraMatches) {
-              const textMatches = para.match(/<a:t[^>]*>(.*?)<\/a:t>/gs);
-              if (!textMatches) continue;
-
-              const fullParaText = textMatches
-                .map((m: string) => m.replace(/<a:t[^>]*>/, '').replace(/<\/a:t>/, ''))
-                .join('')
-                .trim();
-
-              if (fullParaText) {
-                allText.push(fullParaText);
-                if (!slideTitle) {
-                  slideTitle = fullParaText;
-                } else {
-                  slideBullets.push(fullParaText);
-                }
-              }
-            }
-          }
-
-          parsedSlides.push({
-            slideNumber: i,
-            title: slideTitle || `Slide ${i}`,
-            bullets: slideBullets.length > 0 ? slideBullets : allText,
-            rawText: allText,
-          });
-        } catch {
-          if (i > 1) break;
-        }
+      // Restore last read position from MMKV
+      const lastPos = MMKV.getPosition(filePath);
+      let initialIdx = 0;
+      if (lastPos?.slide && lastPos.slide > 0 && lastPos.slide <= count) {
+        initialIdx = lastPos.slide - 1;
+        setCurrentSlideIndex(initialIdx);
       }
 
-      if (parsedSlides.length === 0) {
-        parsedSlides.push({
-          slideNumber: 1,
-          title: fileName,
-          bullets: ['No text slides found in this presentation.'],
-          rawText: [],
+      // 2. Fetch the initial slide
+      const initialSlide = await engine.getPptxSlide(filePath, initialIdx);
+      if (initialSlide) {
+        setPptxSlides({ [initialIdx]: initialSlide as unknown as PptxSlideData });
+      }
+
+      // Prefetch adjacent
+      if (initialIdx + 1 < count) {
+        engine.getPptxSlide(filePath, initialIdx + 1).then((s) => {
+          if (s) setPptxSlides((prev) => ({ ...prev, [initialIdx + 1]: s as unknown as PptxSlideData }));
         });
       }
 
-      setSlides(parsedSlides);
-      setSlideCount(parsedSlides.length);
+      // Also parse legacy slides in background for "Cards View" fallback
+      engine.parsePptxSlides(filePath).then((res) => {
+        if (res && res.slides) {
+          setLegacySlides(res.slides);
+        }
+      }).catch(() => {});
+
+      setIsLoading(false);
+
+      if (initialIdx > 0) {
+        setTimeout(() => {
+          flatListRef.current?.scrollToIndex({ index: initialIdx, animated: false });
+        }, 120);
+      }
     } catch (err: any) {
-      setErrorMsg(`Failed to parse presentation: ${err.message || String(err)}`);
-    } finally {
+      console.warn('Native PPTX parser failed, trying legacy fallback:', err);
+      // Fallback to legacy parser if new parser fails
+      try {
+        const res = await engine.parsePptxSlides(filePath);
+        if (res && res.slides && res.slides.length > 0) {
+          setLegacySlides(res.slides);
+          setSlideCount(res.slides.length);
+          setViewMode('cards');
+          setIsLoading(false);
+          return;
+        }
+      } catch (legacyErr: any) {
+        setErrorMsg(`Failed to open PPTX: ${err.message || String(err)}`);
+      }
       setIsLoading(false);
     }
   };
@@ -182,7 +251,7 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     setErrorMsg(null);
 
     if (isPptx) {
-      loadPptxSlides();
+      loadPptxPresentation();
     } else if (isDocx) {
       ArchiveEngine.getInstance()
         .readFileBase64(filePath)
@@ -200,7 +269,246 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     }
   }, [filePath, formatType, isDocx, isPptx]);
 
-  // --- DOCX Offline HTML Template for WebView ---
+  // Dimensions for presentation slide
+  const availableWidth = isLandscape ? SCREEN_HEIGHT - 32 : SCREEN_WIDTH - 24;
+  const slideWidth = availableWidth * zoomLevel;
+  const slideHeight = slideWidth / slideAspectRatio;
+
+  // Scale from PPTX points to screen pixels
+  // 1 EMU = 1/12700 pt
+  const slideWidthPt = (slideWidthEMU || 12192000) / 12700;
+  const fontScale = (slideWidth / slideWidthPt);
+
+  // --- Render Single Native Presentation Slide ---
+  const renderNativeSlide = (slide: PptxSlideData | undefined, index: number) => {
+    if (!slide) {
+      return (
+        <View style={[styles.slideCanvas, { width: slideWidth, height: slideHeight, backgroundColor: '#0f172a' }]}>
+          <ActivityIndicator color="#38bdf8" size="small" />
+          <Text style={styles.loadingSlideText}>Loading Slide {index + 1}...</Text>
+        </View>
+      );
+    }
+
+    const bg = slide.background;
+    let bgColor = '#FFFFFF';
+    if (bg) {
+      if (bg.type === 'solid' && bg.color) {
+        bgColor = bg.color;
+      } else if (bg.type === 'gradient' && bg.stops && bg.stops.length > 0) {
+        bgColor = bg.stops[0].color;
+      }
+    }
+
+    return (
+      <View
+        style={[
+          styles.slideCanvas,
+          {
+            width: slideWidth,
+            height: slideHeight,
+            backgroundColor: bgColor,
+          },
+        ]}>
+        {/* Background Image if any */}
+        {bg?.type === 'image' && bg.imageUri && (
+          <Image
+            source={{ uri: bg.imageUri }}
+            style={StyleSheet.absoluteFillObject}
+            resizeMode="cover"
+          />
+        )}
+
+        {/* Elements in Z-Order */}
+        {slide.elements.map((el, elIdx) => {
+          const elX = el.x * slideWidth;
+          const elY = el.y * slideHeight;
+          const elW = Math.max(2, el.w * slideWidth);
+          const elH = Math.max(2, el.h * slideHeight);
+
+          // Geometry styling
+          let borderRadius = 0;
+          if (el.geometry === 'ellipse') {
+            borderRadius = 9999;
+          } else if (el.geometry === 'roundRect') {
+            borderRadius = Math.min(elW, elH) * 0.12;
+          }
+
+          // Fill styling
+          let fillBg: string | undefined = undefined;
+          if (el.fill?.type === 'solid' && el.fill.color) {
+            fillBg = el.fill.color;
+          } else if (el.fill?.type === 'none') {
+            fillBg = 'transparent';
+          }
+
+          // Border styling
+          const borderWidth = el.line?.width ? Math.max(1, el.line.width * fontScale * 0.75) : 0;
+          const borderColor = el.line?.color || 'transparent';
+
+          // Transforms (rotation & flip)
+          const transformStyles: any[] = [];
+          if (el.rotation) transformStyles.push({ rotate: `${el.rotation}deg` });
+          if (el.flipH) transformStyles.push({ scaleX: -1 });
+          if (el.flipV) transformStyles.push({ scaleY: -1 });
+
+          // Anchor (vertical text alignment)
+          const justifyContent =
+            el.anchor === 'middle' ? 'center' : el.anchor === 'bottom' ? 'flex-end' : 'flex-start';
+
+          return (
+            <View
+              key={`el-${elIdx}`}
+              style={[
+                styles.slideElement,
+                {
+                  left: elX,
+                  top: elY,
+                  width: elW,
+                  height: elH,
+                  borderRadius,
+                  backgroundColor: fillBg,
+                  borderWidth,
+                  borderColor,
+                  justifyContent,
+                  transform: transformStyles.length > 0 ? transformStyles : undefined,
+                },
+              ]}>
+              {/* 1. Image Element */}
+              {el.type === 'image' && el.imageUri && (
+                <Image
+                  source={{ uri: el.imageUri }}
+                  style={{ width: '100%', height: '100%' }}
+                  resizeMode="contain"
+                />
+              )}
+
+              {/* 2. Text Element */}
+              {el.paragraphs && el.paragraphs.length > 0 && (
+                <View style={{ width: '100%' }}>
+                  {el.paragraphs.map((p, pIdx) => {
+                    const align = p.align === 'center' ? 'center' : p.align === 'right' ? 'right' : 'left';
+                    return (
+                      <View
+                        key={`p-${pIdx}`}
+                        style={[
+                          styles.paragraphRow,
+                          {
+                            justifyContent:
+                              align === 'center' ? 'center' : align === 'right' ? 'flex-end' : 'flex-start',
+                          },
+                        ]}>
+                        {/* Bullet point */}
+                        {p.bullet && (
+                          <Text
+                            style={[
+                              styles.bulletSymbol,
+                              {
+                                fontSize: Math.max(8, 14 * fontScale),
+                                color: p.runs[0]?.color || '#000000',
+                              },
+                            ]}>
+                            {p.bullet === 'auto' ? `${pIdx + 1}. ` : `${p.bullet} `}
+                          </Text>
+                        )}
+
+                        {/* Runs */}
+                        <Text style={{ textAlign: align, flexShrink: 1 }}>
+                          {p.runs.map((r, rIdx) => {
+                            const calculatedSize = Math.max(
+                              7.5,
+                              (r.sizePt || 16) * fontScale * (el.autofit?.fontScale || 1.0)
+                            );
+                            return (
+                              <Text
+                                key={`r-${rIdx}`}
+                                style={{
+                                  fontSize: calculatedSize,
+                                  fontWeight: r.bold ? '700' : '400',
+                                  fontStyle: r.italic ? 'italic' : 'normal',
+                                  textDecorationLine: r.underline ? 'underline' : 'none',
+                                  color: r.color || '#000000',
+                                }}>
+                                {r.text}
+                              </Text>
+                            );
+                          })}
+                        </Text>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+
+              {/* 3. Table Element */}
+              {el.type === 'table' && el.table && (
+                <View style={styles.tableBox}>
+                  {el.table.rows.map((row, rIdx) => (
+                    <View key={`tr-${rIdx}`} style={styles.tableRow}>
+                      {row.map((cell, cIdx) => (
+                        <View
+                          key={`tc-${cIdx}`}
+                          style={[styles.tableCell, { backgroundColor: cell.fill || '#FFFFFF' }]}>
+                          <Text style={{ fontSize: Math.max(7, 11 * fontScale), color: '#000000' }}>
+                            {cell.text}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              {/* 4. Unsupported Shape / Chart Indicator */}
+              {el.type === 'unsupported' && (
+                <View style={styles.unsupportedBadge}>
+                  <Text style={styles.unsupportedText}>[{el.kind || 'Graphic'}]</Text>
+                </View>
+              )}
+            </View>
+          );
+        })}
+      </View>
+    );
+  };
+
+  // --- Render Slide Card for Reading View Fallback ---
+  const renderReadingCard = (item: LegacySlideData) => {
+    return (
+      <View style={[styles.readingCard, { width: availableWidth }]}>
+        <View style={styles.slideCardHeader}>
+          <View style={styles.slideNumberBadge}>
+            <Text style={styles.slideNumberText}>
+              Slide {item.slideNumber} of {slideCount}
+            </Text>
+          </View>
+        </View>
+
+        <Text style={styles.slideCardTitle} numberOfLines={2}>
+          {item.title}
+        </Text>
+
+        {item.imageUris && item.imageUris.length > 0 && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.imageScroll}>
+            {item.imageUris.map((uri, idx) => (
+              <Image key={idx} source={{ uri }} style={styles.slideThumbnail} resizeMode="contain" />
+            ))}
+          </ScrollView>
+        )}
+
+        <ScrollView style={styles.slideBodyScroll} showsVerticalScrollIndicator={false}>
+          {item.bullets.map((bullet, idx) => (
+            <View key={idx} style={styles.bulletRow}>
+              <Text style={styles.bulletDot}>•</Text>
+              <Text style={styles.bulletText}>{bullet}</Text>
+            </View>
+          ))}
+        </ScrollView>
+      </View>
+    );
+  };
+
+  // DOCX Offline HTML Template for WebView
   const docxHtml = `
 <!DOCTYPE html>
 <html>
@@ -215,9 +523,9 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     body {
       margin: 0;
       padding: 12px;
-      background-color: #f1f5f9;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      color: #1f2937;
+      background: #0f172a;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #334155;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -234,7 +542,6 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
       display: flex;
       flex-direction: column;
       align-items: center;
-      width: 100%;
     }
     .docx-wrapper > section.docx {
       background: #ffffff !important;
@@ -242,59 +549,14 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
       margin-bottom: 20px !important;
       padding: 40px 32px !important;
       width: 100% !important;
-      max-width: 794px !important;
-      min-height: 1000px;
-      border-radius: 6px !important;
-      border: 1px solid #e2e8f0;
-    }
-    table {
-      border-collapse: collapse;
-      width: 100% !important;
-      margin: 16px 0;
-    }
-    td, th {
-      border: 1px solid #cbd5e1 !important;
-      padding: 8px 12px;
-      font-size: 13px;
-    }
-    th {
-      background-color: #f8fafc;
-      font-weight: 600;
-    }
-    img {
-      max-width: 100% !important;
-      height: auto !important;
-      display: block;
-      margin: 12px auto;
-    }
-    #mammoth-fallback {
-      width: 100%;
-      max-width: 794px;
-      background: #ffffff;
-      padding: 40px 32px;
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
-      border-radius: 6px;
-      border: 1px solid #e2e8f0;
-    }
-    #notice-box {
-      display: none;
-      width: 100%;
-      max-width: 794px;
-      background: #fef2f2;
-      border: 1px solid #f87171;
-      color: #991b1b;
-      padding: 12px 16px;
-      border-radius: 6px;
-      margin-bottom: 14px;
-      font-size: 13px;
+      max-width: 820px !important;
+      border-radius: 8px !important;
     }
   </style>
 </head>
 <body>
-  <div id="notice-box"></div>
   <div id="docx-container"></div>
   <div id="mammoth-fallback" style="display:none;"></div>
-
   <script>
     function base64ToArrayBuffer(base64) {
       var binaryString = window.atob(base64);
@@ -306,22 +568,18 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
       return bytes.buffer;
     }
 
-    function loadDocxFile() {
-      var container = document.getElementById('docx-container');
-      var noticeBox = document.getElementById('notice-box');
-      var fallbackContainer = document.getElementById('mammoth-fallback');
+    var isRendering = false;
+    function doRender(b64) {
+      if (!b64 || b64.length === 0 || isRendering) return;
+      var container = document.getElementById("docx-container");
+      var fallbackContainer = document.getElementById("mammoth-fallback");
+      var arrayBuffer = base64ToArrayBuffer(b64);
 
-      try {
-        var b64 = window.__DOCX_B64__;
-        if (!b64 || b64.length === 0) {
-          throw new Error('No DOCX file data provided');
-        }
-
-        var arrayBuffer = base64ToArrayBuffer(b64);
-
+      function tryDocx() {
         if (typeof docx !== 'undefined' && docx.renderAsync) {
+          isRendering = true;
           docx.renderAsync(arrayBuffer, container, null, {
-            className: 'docx',
+            className: "docx",
             inWrapper: true,
             ignoreWidth: false,
             ignoreHeight: false,
@@ -333,67 +591,128 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
             renderFooters: true,
           }).then(function() {
             if (window.ReactNativeWebView) {
-              window.ReactNativeWebView.postMessage(JSON.stringify({
-                type: 'DOCX_RENDERED',
-                engine: 'docx-preview'
-              }));
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'DOCX_RENDERED', engine: 'docx-preview' }));
             }
           }).catch(function(err) {
-            console.warn('docx-preview failed, trying mammoth fallback:', err);
-            tryMammothFallback(arrayBuffer);
+            console.warn('docx-preview error, falling back to mammoth:', err);
+            tryMammoth();
           });
-          return;
+          return true;
         }
-
-        tryMammothFallback(arrayBuffer);
-      } catch (err) {
-        noticeBox.style.display = 'block';
-        noticeBox.innerHTML = '<strong>Render Notice:</strong> ' + (err.message || String(err));
-        if (window.ReactNativeWebView) {
-          window.ReactNativeWebView.postMessage(JSON.stringify({
-            type: 'DOCX_ERROR',
-            error: err.message || String(err)
-          }));
-        }
+        return false;
       }
 
-      function tryMammothFallback(buf) {
+      function tryMammoth() {
         if (typeof mammoth !== 'undefined' && mammoth.convertToHtml) {
-          mammoth.convertToHtml({ arrayBuffer: buf })
-            .then(function(result) {
-              container.style.display = 'none';
-              fallbackContainer.style.display = 'block';
-              fallbackContainer.innerHTML = result.value;
-              if (window.ReactNativeWebView) {
-                window.ReactNativeWebView.postMessage(JSON.stringify({
-                  type: 'DOCX_RENDERED',
-                  engine: 'mammoth'
-                }));
-              }
-            })
-            .catch(function(err) {
-              noticeBox.style.display = 'block';
-              noticeBox.innerHTML = '<strong>Conversion Error:</strong> ' + (err.message || String(err));
-            });
+          isRendering = true;
+          mammoth.convertToHtml({ arrayBuffer: arrayBuffer }).then(function(result) {
+            container.style.display = 'none';
+            fallbackContainer.style.display = 'block';
+            fallbackContainer.innerHTML = result.value;
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'DOCX_RENDERED', engine: 'mammoth' }));
+            }
+          }).catch(function(err) {
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'DOCX_ERROR', error: err.message || String(err) }));
+            }
+          });
+          return true;
         }
+        return false;
+      }
+
+      // Poll until docx-preview or mammoth is ready
+      var tries = 0;
+      function pollLibraries() {
+        if (tryDocx()) return;
+        tries++;
+        if (tries < 40) {
+          setTimeout(pollLibraries, 50);
+        } else {
+          tryMammoth();
+        }
+      }
+      pollLibraries();
+    }
+
+    window.renderDocx = doRender;
+
+    function checkAndRun() {
+      var b64 = window.__DOCX_B64__;
+      if (b64 && b64.length > 0) {
+        doRender(b64);
       }
     }
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
-      loadDocxFile();
+      checkAndRun();
     } else {
-      window.addEventListener('DOMContentLoaded', loadDocxFile);
+      window.addEventListener('DOMContentLoaded', checkAndRun);
+      window.addEventListener('load', checkAndRun);
     }
   </script>
 </body>
 </html>
 `;
 
+  const applyDocxStyle = useCallback((font = docFontScale, mode = docViewMode) => {
+    if (!webViewRef.current) return;
+    const isRead = mode === 'reading';
+    const percent = Math.round(font * 100);
+    const js = `
+      (function() {
+        var container = document.getElementById('docx-container');
+        if (container) {
+          container.style.fontSize = '${percent}%';
+        }
+        var sections = document.querySelectorAll('.docx-wrapper > section.docx');
+        for (var i = 0; i < sections.length; i++) {
+          var s = sections[i];
+          s.style.fontSize = '${percent}%';
+          if (${isRead}) {
+            s.style.maxWidth = '100%';
+            s.style.padding = '16px';
+            s.style.boxShadow = 'none';
+            s.style.borderRadius = '0px';
+          } else {
+            s.style.maxWidth = '820px';
+            s.style.padding = '40px 32px';
+            s.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.1)';
+            s.style.borderRadius = '8px';
+          }
+        }
+      })();
+      true;
+    `;
+    webViewRef.current.injectJavaScript(js);
+  }, [docFontScale, docViewMode]);
+
+  useEffect(() => {
+    if (isDocx && !isLoading && base64Content.length > 0) {
+      applyDocxStyle(docFontScale, docViewMode);
+    }
+  }, [isDocx, isLoading, base64Content, docFontScale, docViewMode, applyDocxStyle]);
+
+  // Keep thumbnail list centered on current slide
+  useEffect(() => {
+    if (thumbnailListRef.current && slideCount > 0) {
+      try {
+        thumbnailListRef.current.scrollToIndex({
+          index: currentSlideIndex,
+          animated: true,
+          viewPosition: 0.5,
+        });
+      } catch {}
+    }
+  }, [currentSlideIndex, slideCount]);
+
   const onWebViewMessage = (event: any) => {
     try {
       const data = JSON.parse(event.nativeEvent.data);
       if (data.type === 'DOCX_RENDERED') {
         setIsLoading(false);
+        applyDocxStyle();
       } else if (data.type === 'DOCX_ERROR') {
         setIsLoading(false);
         setErrorMsg(data.error || 'Failed to render document.');
@@ -401,67 +720,6 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     } catch {
       setIsLoading(false);
     }
-  };
-
-  // Dimensions for 16:9 Presentation Cards
-  const cardWidth = isLandscape ? SCREEN_HEIGHT - 48 : SCREEN_WIDTH - 32;
-  const cardHeight = isLandscape ? SCREEN_WIDTH - 150 : cardWidth * (10 / 16);
-
-  // --- Render Slide Card for PPTX Native Engine ---
-  const renderSlideCard = ({ item }: { item: SlideData }) => {
-    return (
-      <View style={[styles.slideCard, { width: cardWidth, minHeight: cardHeight }]}>
-        {/* Slide Header */}
-        <View style={styles.slideCardHeader}>
-          <View style={styles.slideNumberBadge}>
-            <Text style={styles.slideNumberText}>
-              Slide {item.slideNumber} of {slideCount}
-            </Text>
-          </View>
-        </View>
-
-        {/* Slide Title */}
-        <Text style={styles.slideCardTitle} numberOfLines={2}>
-          {item.title}
-        </Text>
-
-        {/* Slide Images if any */}
-        {item.imageUris && item.imageUris.length > 0 && (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={styles.imageScroll}
-            contentContainerStyle={styles.imageScrollContent}>
-            {item.imageUris.map((uri, idx) => (
-              <Image
-                key={idx}
-                source={{ uri }}
-                style={styles.slideThumbnail}
-                resizeMode="contain"
-              />
-            ))}
-          </ScrollView>
-        )}
-
-        {/* Slide Bullets */}
-        <ScrollView
-          style={styles.slideBodyScroll}
-          contentContainerStyle={styles.slideBodyContent}
-          showsVerticalScrollIndicator={false}
-          nestedScrollEnabled>
-          {item.bullets.length > 0 ? (
-            item.bullets.map((bullet, idx) => (
-              <View key={idx} style={styles.bulletRow}>
-                <Text style={styles.bulletDot}>•</Text>
-                <Text style={styles.bulletText}>{bullet}</Text>
-              </View>
-            ))
-          ) : (
-            <Text style={styles.visualSlideNotice}>[Visual slide with graphic layout]</Text>
-          )}
-        </ScrollView>
-      </View>
-    );
   };
 
   return (
@@ -484,15 +742,59 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
         </View>
 
         <View style={styles.headerRight}>
+          {isDocx && (
+            <>
+              {/* Toggle Reading View vs A4 Page */}
+              <TouchableOpacity
+                style={[styles.headerBtn, docViewMode === 'reading' && styles.headerBtnActive]}
+                onPress={() => setDocViewMode((m) => (m === 'a4' ? 'reading' : 'a4'))}
+                activeOpacity={0.7}>
+                <Text style={styles.headerBtnText}>
+                  {docViewMode === 'reading' ? '📖 Read' : '📄 A4'}
+                </Text>
+              </TouchableOpacity>
+
+              {/* Font Scale Controls */}
+              <TouchableOpacity
+                style={[styles.headerBtn, docFontScale <= 0.8 && styles.zoomBtnDisabled]}
+                disabled={docFontScale <= 0.8}
+                onPress={() => setDocFontScale((s) => Math.max(0.8, Number((s - 0.1).toFixed(1))))}
+                activeOpacity={0.7}>
+                <Text style={styles.headerBtnText}>A−</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.headerBtn, docFontScale >= 1.6 && styles.zoomBtnDisabled]}
+                disabled={docFontScale >= 1.6}
+                onPress={() => setDocFontScale((s) => Math.min(1.6, Number((s + 0.1).toFixed(1))))}
+                activeOpacity={0.7}>
+                <Text style={styles.headerBtnText}>A+</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
           {isPptx && (
-            <TouchableOpacity
-              style={[styles.headerBtn, isLandscape && styles.headerBtnActive]}
-              onPress={() => setIsLandscape(!isLandscape)}
-              activeOpacity={0.7}>
-              <Text style={styles.headerBtnText}>
-                {isLandscape ? '📱 Portrait' : '⛶ Landscape'}
-              </Text>
-            </TouchableOpacity>
+            <>
+              {/* Toggle Deck / Cards View */}
+              <TouchableOpacity
+                style={[styles.headerBtn, viewMode === 'deck' && styles.headerBtnActive]}
+                onPress={() => setViewMode(viewMode === 'deck' ? 'cards' : 'deck')}
+                activeOpacity={0.7}>
+                <Text style={styles.headerBtnText}>
+                  {viewMode === 'deck' ? '🎨 Deck' : '📑 Cards'}
+                </Text>
+              </TouchableOpacity>
+
+              {/* Orientation Toggle */}
+              <TouchableOpacity
+                style={[styles.headerBtn, isLandscape && styles.headerBtnActive]}
+                onPress={() => setIsLandscape(!isLandscape)}
+                activeOpacity={0.7}>
+                <Text style={styles.headerBtnText}>
+                  {isLandscape ? '📱 Port' : '⛶ Land'}
+                </Text>
+              </TouchableOpacity>
+            </>
           )}
 
           <TouchableOpacity style={styles.headerBtn} onPress={handleShare} activeOpacity={0.7}>
@@ -510,7 +812,7 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
         <View style={styles.loadingContainer}>
           <ActivityIndicator color="#38bdf8" size="large" />
           <Text style={styles.loadingText}>
-            {isPptx ? 'Opening slides...' : 'Rendering document...'}
+            {isPptx ? 'Rendering presentation...' : 'Rendering document...'}
           </Text>
         </View>
       )}
@@ -525,6 +827,7 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
       {/* 1. DOCX: High-Fidelity WebView Renderer */}
       {isDocx && base64Content.length > 0 && (
         <WebView
+          ref={webViewRef}
           originWhitelist={['*']}
           source={{
             html: docxHtml,
@@ -534,6 +837,17 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
             window.__DOCX_B64__ = ${JSON.stringify(base64Content)};
             true;
           `}
+          onLoadEnd={() => {
+            if (base64Content) {
+              webViewRef.current?.injectJavaScript(`
+                window.__DOCX_B64__ = ${JSON.stringify(base64Content)};
+                if (typeof window.renderDocx === 'function') {
+                  window.renderDocx(${JSON.stringify(base64Content)});
+                }
+                true;
+              `);
+            }
+          }}
           style={styles.webView}
           allowFileAccess={true}
           allowFileAccessFromFileURLs={true}
@@ -544,30 +858,78 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
         />
       )}
 
-      {/* 2. PPTX: Pure Native 16:9 Presentation Engine (Zero Freeze, Instant Load) */}
+      {/* 2. PPTX: Phase 2 Native High-Fidelity Presentation Deck */}
       {isPptx && (
         <View style={styles.pptxContainer}>
           <FlatList
             ref={flatListRef}
-            data={slides}
-            keyExtractor={(item) => `slide-${item.slideNumber}`}
-            renderItem={renderSlideCard}
+            data={Array.from({ length: slideCount }).map((_, i) => i)}
+            keyExtractor={(idx) => `slide-${idx}`}
             horizontal
-            pagingEnabled
+            pagingEnabled={zoomLevel <= 1.0}
             showsHorizontalScrollIndicator={false}
-            snapToInterval={cardWidth + 16}
+            snapToInterval={availableWidth + 16}
             decelerationRate="fast"
             contentContainerStyle={styles.pptxListContent}
+            onScrollToIndexFailed={() => {}}
             onMomentumScrollEnd={(e) => {
               const x = e.nativeEvent.contentOffset.x;
-              const idx = Math.round(x / (cardWidth + 16));
+              const idx = Math.round(x / (availableWidth + 16));
               const safeIdx = Math.max(0, Math.min(idx, slideCount - 1));
               setCurrentSlideIndex(safeIdx);
               MMKV.savePosition(filePath, { slide: safeIdx + 1, total: slideCount });
             }}
+            renderItem={({ item: index }) => {
+              if (viewMode === 'cards' && legacySlides[index]) {
+                return renderReadingCard(legacySlides[index]);
+              }
+              const slideData = pptxSlides[index];
+              return (
+                <View style={[styles.slideWrapper, { width: availableWidth }]}>
+                  <ScrollView
+                    horizontal={zoomLevel > 1.0}
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={{ alignItems: 'center', justifyContent: 'center' }}>
+                    {renderNativeSlide(slideData, index)}
+                  </ScrollView>
+                </View>
+              );
+            }}
           />
 
-          {/* Bottom Toolbar for PPTX */}
+          {/* Thumbnails Tray */}
+          {slideCount > 1 && (
+            <View style={styles.thumbnailTrayContainer}>
+              <FlatList
+                ref={thumbnailListRef}
+                data={Array.from({ length: slideCount }).map((_, i) => i)}
+                keyExtractor={(idx) => `thumb-${idx}`}
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.thumbnailTrayContent}
+                onScrollToIndexFailed={() => {}}
+                renderItem={({ item: idx }) => {
+                  const isActive = idx === currentSlideIndex;
+                  return (
+                    <TouchableOpacity
+                      style={[styles.thumbnailPill, isActive && styles.thumbnailPillActive]}
+                      onPress={() => {
+                        setCurrentSlideIndex(idx);
+                        flatListRef.current?.scrollToIndex({ index: idx, animated: true });
+                        MMKV.savePosition(filePath, { slide: idx + 1, total: slideCount });
+                      }}
+                      activeOpacity={0.7}>
+                      <Text style={[styles.thumbnailPillText, isActive && styles.thumbnailPillTextActive]}>
+                        {idx + 1}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                }}
+              />
+            </View>
+          )}
+
+          {/* Bottom Toolbar for PPTX with Zoom and Navigation */}
           <View style={styles.bottomBar}>
             <TouchableOpacity
               style={[styles.navBtn, currentSlideIndex === 0 && styles.navBtnDisabled]}
@@ -582,11 +944,35 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
               <Text style={styles.navBtnText}>◀ Prev</Text>
             </TouchableOpacity>
 
+            {/* Slide Index Badge */}
             <View style={styles.slidePill}>
               <Text style={styles.slidePillText}>
                 Slide {currentSlideIndex + 1} / {slideCount}
               </Text>
             </View>
+
+            {/* Zoom Controls */}
+            {viewMode === 'deck' && (
+              <View style={styles.zoomControls}>
+                <TouchableOpacity
+                  style={[styles.zoomBtn, zoomLevel <= 1.0 && styles.zoomBtnDisabled]}
+                  disabled={zoomLevel <= 1.0}
+                  onPress={() => setZoomLevel((z) => Math.max(1.0, z - 0.25))}
+                  activeOpacity={0.7}>
+                  <Text style={styles.zoomBtnText}>−</Text>
+                </TouchableOpacity>
+
+                <Text style={styles.zoomLabel}>{Math.round(zoomLevel * 100)}%</Text>
+
+                <TouchableOpacity
+                  style={[styles.zoomBtn, zoomLevel >= 2.5 && styles.zoomBtnDisabled]}
+                  disabled={zoomLevel >= 2.5}
+                  onPress={() => setZoomLevel((z) => Math.min(2.5, z + 0.25))}
+                  activeOpacity={0.7}>
+                  <Text style={styles.zoomBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            )}
 
             <TouchableOpacity
               style={[styles.navBtn, currentSlideIndex === slideCount - 1 && styles.navBtnDisabled]}
@@ -631,13 +1017,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     backgroundColor: '#0f172a',
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#1e293b',
   },
   fileName: {
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '700',
     color: '#f8fafc',
   },
@@ -649,11 +1035,11 @@ const styles = StyleSheet.create({
   headerRight: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   headerBtn: {
     backgroundColor: '#1e293b',
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 8,
     borderWidth: 1,
@@ -665,7 +1051,7 @@ const styles = StyleSheet.create({
   },
   headerBtnText: {
     color: '#e2e8f0',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
   },
   closeBtn: {
@@ -692,6 +1078,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
   },
+  loadingSlideText: {
+    color: '#94a3b8',
+    marginTop: 8,
+    fontSize: 12,
+  },
   errorBox: {
     margin: 12,
     backgroundColor: '#7f1d1d',
@@ -710,25 +1101,83 @@ const styles = StyleSheet.create({
   pptxContainer: {
     flex: 1,
     justifyContent: 'space-between',
-    paddingVertical: 12,
+    paddingVertical: 8,
   },
   pptxListContent: {
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
   },
-  slideCard: {
+  slideWrapper: {
+    marginRight: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  slideCanvas: {
+    borderRadius: 8,
+    overflow: 'hidden',
+    position: 'relative',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    elevation: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  slideElement: {
+    position: 'absolute',
+    overflow: 'hidden',
+  },
+  paragraphRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    width: '100%',
+    marginBottom: 2,
+  },
+  bulletSymbol: {
+    marginRight: 4,
+    lineHeight: 18,
+  },
+  tableBox: {
+    width: '100%',
+    height: '100%',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  tableRow: {
+    flexDirection: 'row',
+    flex: 1,
+  },
+  tableCell: {
+    flex: 1,
+    borderWidth: 0.5,
+    borderColor: '#cbd5e1',
+    padding: 2,
+    justifyContent: 'center',
+  },
+  unsupportedBadge: {
+    flex: 1,
+    backgroundColor: 'rgba(100, 116, 139, 0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(100, 116, 139, 0.3)',
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  unsupportedText: {
+    fontSize: 10,
+    color: '#94a3b8',
+    fontWeight: '600',
+  },
+  readingCard: {
     backgroundColor: '#131d31',
     borderRadius: 14,
     padding: 18,
     marginRight: 16,
     borderWidth: 1,
     borderColor: '#1e293b',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.4,
-    shadowRadius: 10,
-    elevation: 6,
+    minHeight: 280,
   },
   slideCardHeader: {
     flexDirection: 'row',
@@ -760,21 +1209,15 @@ const styles = StyleSheet.create({
     maxHeight: 120,
     marginBottom: 10,
   },
-  imageScrollContent: {
-    gap: 8,
-    alignItems: 'center',
-  },
   slideThumbnail: {
     width: 140,
     height: 100,
     borderRadius: 8,
     backgroundColor: '#0f172a',
+    marginRight: 8,
   },
   slideBodyScroll: {
     flex: 1,
-  },
-  slideBodyContent: {
-    paddingVertical: 4,
   },
   bulletRow: {
     flexDirection: 'row',
@@ -794,18 +1237,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
   },
-  visualSlideNotice: {
-    color: '#64748b',
-    fontSize: 13,
-    fontStyle: 'italic',
-    textAlign: 'center',
-    marginTop: 20,
-  },
   bottomBar: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
+    paddingHorizontal: 16,
     paddingVertical: 10,
     backgroundColor: '#0f172a',
     borderTopWidth: 1,
@@ -829,7 +1265,7 @@ const styles = StyleSheet.create({
   },
   slidePill: {
     backgroundColor: 'rgba(56, 189, 248, 0.12)',
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 16,
     borderWidth: 1,
@@ -837,8 +1273,35 @@ const styles = StyleSheet.create({
   },
   slidePillText: {
     color: '#38bdf8',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '700',
+  },
+  zoomControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1e293b',
+    borderRadius: 8,
+    paddingHorizontal: 4,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  zoomBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  zoomBtnDisabled: {
+    opacity: 0.3,
+  },
+  zoomBtnText: {
+    color: '#f8fafc',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  zoomLabel: {
+    color: '#94a3b8',
+    fontSize: 11,
+    fontWeight: '600',
+    paddingHorizontal: 4,
   },
   legacyBox: {
     flex: 1,
@@ -872,6 +1335,40 @@ const styles = StyleSheet.create({
   openExternalText: {
     color: '#ffffff',
     fontSize: 14,
+    fontWeight: '700',
+  },
+  thumbnailTrayContainer: {
+    backgroundColor: '#0f172a',
+    borderTopWidth: 1,
+    borderTopColor: '#1e293b',
+    paddingVertical: 6,
+  },
+  thumbnailTrayContent: {
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  thumbnailPill: {
+    minWidth: 44,
+    height: 34,
+    borderRadius: 6,
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  thumbnailPillActive: {
+    backgroundColor: '#0284c7',
+    borderColor: '#38bdf8',
+  },
+  thumbnailPillText: {
+    fontSize: 12,
+    color: '#94a3b8',
+    fontWeight: '600',
+  },
+  thumbnailPillTextActive: {
+    color: '#ffffff',
     fontWeight: '700',
   },
 });

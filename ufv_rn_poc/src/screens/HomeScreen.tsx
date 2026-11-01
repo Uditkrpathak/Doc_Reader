@@ -299,10 +299,21 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
       return;
     }
 
-    if (category === 'OFFICE_DOCX') formatType = 'DOCX';
-    else if (category === 'OFFICE_PPTX') formatType = 'PPTX';
-    else if (category === 'LEGACY_OLE_DOC') formatType = 'DOC';
-    else if (category === 'LEGACY_OLE_PPT') formatType = 'PPT';
+    if (ext === 'docx' || category === 'OFFICE_DOCX') {
+      formatType = 'DOCX';
+      category = 'OFFICE_DOCX';
+    } else if (ext === 'pptx' || category === 'OFFICE_PPTX') {
+      formatType = 'PPTX';
+      category = 'OFFICE_PPTX';
+    } else if (ext === 'doc' || category === 'LEGACY_OLE_DOC') {
+      formatType = 'DOC';
+      category = 'LEGACY_OLE_DOC';
+    } else if (ext === 'ppt' || category === 'LEGACY_OLE_PPT') {
+      formatType = 'PPT';
+      category = 'LEGACY_OLE_PPT';
+    } else if (ext === 'pdf' || category === 'PDF') {
+      category = 'PDF';
+    }
 
     setActiveViewer({
       file: fileName,

@@ -144,6 +144,44 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun resolveArchiveFile(filePath: String): File {
+        if (filePath.startsWith("content://")) {
+            try {
+                val uri = Uri.parse(filePath)
+                var displayName = "shared_file_${System.currentTimeMillis()}"
+                try {
+                    reactContext.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (nameIdx >= 0 && cursor.moveToFirst()) {
+                            val name = cursor.getString(nameIdx)
+                            if (!name.isNullOrBlank()) {
+                                displayName = name
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+
+                val incomingDir = File(reactContext.cacheDir, "incoming")
+                if (!incomingDir.exists()) incomingDir.mkdirs()
+                val targetFile = File(incomingDir, displayName)
+
+                // If already cached and recent (< 60s), reuse it
+                if (targetFile.exists() && targetFile.length() > 0 && (System.currentTimeMillis() - targetFile.lastModified() < 60000)) {
+                    return targetFile
+                }
+
+                reactContext.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(targetFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (targetFile.exists() && targetFile.length() > 0) {
+                    return targetFile
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("ArchiveModule", "Failed to resolve content URI: ${e.message}")
+            }
+        }
+
         val cleanPath = if (filePath.startsWith("file://")) filePath.substring(7) else filePath
         val f = File(cleanPath)
         if (f.exists() && f.isFile) return f
@@ -153,6 +191,7 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
         val candidates = listOf(
             f,
             File(reactContext.cacheDir, fileName),
+            File(reactContext.cacheDir, "incoming/$fileName"),
             File(reactContext.cacheDir, "zip_extracted/$fileName"),
             File(reactContext.cacheDir, "rar_extracted/$fileName"),
             File(downloadDir, fileName),
