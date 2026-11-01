@@ -26,12 +26,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-          cache-dependency-path: 'ufv_rn_poc/package-lock.json'
 
       - name: Install NPM dependencies
         working-directory: ./ufv_rn_poc
-        run: npm ci
+        run: npm install --legacy-peer-deps
 
       - name: Grant execute permission for gradlew
         working-directory: ./ufv_rn_poc/android
