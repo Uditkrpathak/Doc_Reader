@@ -232,6 +232,13 @@ export class ArchiveEngine {
     return await ArchiveModule.deleteCachedFile(filePath);
   }
 
+  public async cleanTemporaryCache(): Promise<{ freedBytes: number }> {
+    if (Platform.OS !== 'android' || !ArchiveModule?.cleanTemporaryCache) {
+      return { freedBytes: 0 };
+    }
+    return await ArchiveModule.cleanTemporaryCache();
+  }
+
   public async extract(
     archivePath: string,
     destinationDir: string,

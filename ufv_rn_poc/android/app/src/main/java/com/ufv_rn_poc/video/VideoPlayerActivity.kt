@@ -12,6 +12,8 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -187,7 +189,14 @@ class VideoPlayerActivity : Activity() {
         playbackStatus = "PREPARING"
         updateHud()
 
-        val exo = ExoPlayer.Builder(this).build()
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
+        val exo = ExoPlayer.Builder(this)
+            .setAudioAttributes(audioAttributes, true)
+            .build()
         player = exo
         playerView.player = exo
 
@@ -457,8 +466,20 @@ class VideoPlayerActivity : Activity() {
         finish()
     }
 
+    override fun onPause() {
+        super.onPause()
+        // Video must never play in the background or during incoming calls / interruptions
+        player?.playWhenReady = false
+    }
+
+    override fun onStop() {
+        super.onStop()
+        player?.playWhenReady = false
+    }
+
     override fun onDestroy() {
         try {
+            player?.stop()
             player?.release()
             player = null
         } catch (ignored: Exception) {}

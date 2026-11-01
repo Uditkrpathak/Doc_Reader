@@ -19,5 +19,10 @@ class MainActivity : ReactActivity() {
       setIntent(intent)
       intent?.let { ArchiveModule.handleIncomingIntent(reactInstanceManager.currentReactContext, it) }
   }
+
+  override fun onDestroy() {
+      ArchiveModule.stopActivePlayback()
+      super.onDestroy()
+  }
 }
 

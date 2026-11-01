@@ -342,9 +342,17 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
             fillBg = 'transparent';
           }
 
-          // Border styling
-          const borderWidth = el.line?.width ? Math.max(1, el.line.width * fontScale * 0.75) : 0;
-          const borderColor = el.line?.color || 'transparent';
+          // Border styling (prevents phantom border outlines on text frames)
+          let borderWidth = 0;
+          let borderColor = 'transparent';
+          if (el.line && el.line.color && el.line.color !== 'transparent') {
+            const hasText = el.paragraphs && el.paragraphs.length > 0;
+            const isTextFrame = el.type === 'text' || hasText;
+            if (!isTextFrame) {
+              borderWidth = Math.max(1, (el.line.width || 1) * fontScale * 0.75);
+              borderColor = el.line.color;
+            }
+          }
 
           // Transforms (rotation & flip)
           const transformStyles: any[] = [];
@@ -522,10 +530,10 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 12px;
+      padding: 10px 8px;
       background: #0f172a;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      color: #334155;
+      color: #1e293b;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -539,18 +547,37 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
     .docx-wrapper {
       background: transparent !important;
       padding: 0 !important;
+      width: 100% !important;
       display: flex;
       flex-direction: column;
       align-items: center;
     }
     .docx-wrapper > section.docx {
       background: #ffffff !important;
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1) !important;
-      margin-bottom: 20px !important;
-      padding: 40px 32px !important;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25) !important;
+      margin-bottom: 16px !important;
+      padding: 24px 18px !important;
       width: 100% !important;
       max-width: 820px !important;
-      border-radius: 8px !important;
+      border-radius: 10px !important;
+      box-sizing: border-box !important;
+    }
+    table {
+      max-width: 100% !important;
+      border-collapse: collapse !important;
+      margin: 12px 0 !important;
+      font-size: 13px !important;
+    }
+    th, td {
+      border: 1px solid #cbd5e1 !important;
+      padding: 8px 10px !important;
+      text-align: left !important;
+      vertical-align: top !important;
+    }
+    th {
+      background: #f1f5f9 !important;
+      font-weight: 700 !important;
+      color: #0f172a !important;
     }
   </style>
 </head>
@@ -728,82 +755,83 @@ export const OfficeViewer: React.FC<OfficeViewerProps> = ({
 
       {/* Top Header */}
       <View style={styles.header}>
-        <View style={{ flex: 1, marginRight: 8 }}>
-          <Text style={styles.fileName} numberOfLines={1}>
-            {isDocx ? '📘' : isPptx ? '📙' : '📄'} {fileName}
-          </Text>
-          <Text style={styles.subText}>
-            {isDocx
-              ? 'Word Document'
-              : isPptx
-              ? `Presentation • ${slideCount} Slide${slideCount > 1 ? 's' : ''}`
-              : 'Legacy Office Document'}
-          </Text>
+        <View style={styles.headerMainRow}>
+          <TouchableOpacity style={styles.backCloseBtn} onPress={onClose} activeOpacity={0.7}>
+            <Text style={styles.backCloseIcon}>←</Text>
+          </TouchableOpacity>
+
+          <View style={styles.headerTitleBox}>
+            <Text style={styles.fileName} numberOfLines={1}>
+              {isDocx ? '📘' : isPptx ? '📙' : '📄'} {fileName}
+            </Text>
+            <Text style={styles.subText}>
+              {isDocx
+                ? 'Word Document'
+                : isPptx
+                ? `Presentation • ${slideCount} Slide${slideCount > 1 ? 's' : ''}`
+                : 'Legacy Office Document'}
+            </Text>
+          </View>
+
+          <TouchableOpacity style={styles.shareBtn} onPress={handleShare} activeOpacity={0.7}>
+            <Text style={styles.shareIconText}>📤</Text>
+          </TouchableOpacity>
         </View>
 
-        <View style={styles.headerRight}>
+        {/* Sub-Toolbar for Mode & Formatting */}
+        <View style={styles.subToolbar}>
           {isDocx && (
-            <>
-              {/* Toggle Reading View vs A4 Page */}
+            <View style={styles.toolbarContent}>
               <TouchableOpacity
-                style={[styles.headerBtn, docViewMode === 'reading' && styles.headerBtnActive]}
+                style={[styles.toolPill, docViewMode === 'reading' && styles.toolPillActive]}
                 onPress={() => setDocViewMode((m) => (m === 'a4' ? 'reading' : 'a4'))}
                 activeOpacity={0.7}>
-                <Text style={styles.headerBtnText}>
-                  {docViewMode === 'reading' ? '📖 Read' : '📄 A4'}
+                <Text style={[styles.toolPillText, docViewMode === 'reading' && styles.toolPillTextActive]}>
+                  {docViewMode === 'reading' ? '📖 Reading View' : '📄 A4 Page View'}
                 </Text>
               </TouchableOpacity>
 
-              {/* Font Scale Controls */}
-              <TouchableOpacity
-                style={[styles.headerBtn, docFontScale <= 0.8 && styles.zoomBtnDisabled]}
-                disabled={docFontScale <= 0.8}
-                onPress={() => setDocFontScale((s) => Math.max(0.8, Number((s - 0.1).toFixed(1))))}
-                activeOpacity={0.7}>
-                <Text style={styles.headerBtnText}>A−</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.headerBtn, docFontScale >= 1.6 && styles.zoomBtnDisabled]}
-                disabled={docFontScale >= 1.6}
-                onPress={() => setDocFontScale((s) => Math.min(1.6, Number((s + 0.1).toFixed(1))))}
-                activeOpacity={0.7}>
-                <Text style={styles.headerBtnText}>A+</Text>
-              </TouchableOpacity>
-            </>
+              <View style={styles.fontScaleGroup}>
+                <TouchableOpacity
+                  style={[styles.fontStepBtn, docFontScale <= 0.8 && styles.stepBtnDisabled]}
+                  disabled={docFontScale <= 0.8}
+                  onPress={() => setDocFontScale((s) => Math.max(0.8, Number((s - 0.1).toFixed(1))))}
+                  activeOpacity={0.7}>
+                  <Text style={styles.fontStepText}>A−</Text>
+                </TouchableOpacity>
+                <Text style={styles.fontScaleDisplay}>{Math.round(docFontScale * 100)}%</Text>
+                <TouchableOpacity
+                  style={[styles.fontStepBtn, docFontScale >= 1.6 && styles.stepBtnDisabled]}
+                  disabled={docFontScale >= 1.6}
+                  onPress={() => setDocFontScale((s) => Math.min(1.6, Number((s + 0.1).toFixed(1))))}
+                  activeOpacity={0.7}>
+                  <Text style={styles.fontStepText}>A+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
           )}
 
           {isPptx && (
-            <>
-              {/* Toggle Deck / Cards View */}
+            <View style={styles.toolbarContent}>
               <TouchableOpacity
-                style={[styles.headerBtn, viewMode === 'deck' && styles.headerBtnActive]}
+                style={[styles.toolPill, viewMode === 'deck' && styles.toolPillActive]}
                 onPress={() => setViewMode(viewMode === 'deck' ? 'cards' : 'deck')}
                 activeOpacity={0.7}>
-                <Text style={styles.headerBtnText}>
-                  {viewMode === 'deck' ? '🎨 Deck' : '📑 Cards'}
+                <Text style={[styles.toolPillText, viewMode === 'deck' && styles.toolPillTextActive]}>
+                  {viewMode === 'deck' ? '🎨 Slide Deck' : '📝 Text Cards'}
                 </Text>
               </TouchableOpacity>
 
-              {/* Orientation Toggle */}
               <TouchableOpacity
-                style={[styles.headerBtn, isLandscape && styles.headerBtnActive]}
+                style={[styles.toolPill, isLandscape && styles.toolPillActive]}
                 onPress={() => setIsLandscape(!isLandscape)}
                 activeOpacity={0.7}>
-                <Text style={styles.headerBtnText}>
-                  {isLandscape ? '📱 Port' : '⛶ Land'}
+                <Text style={[styles.toolPillText, isLandscape && styles.toolPillTextActive]}>
+                  {isLandscape ? '📱 Portrait' : '🔄 Landscape'}
                 </Text>
               </TouchableOpacity>
-            </>
+            </View>
           )}
-
-          <TouchableOpacity style={styles.headerBtn} onPress={handleShare} activeOpacity={0.7}>
-            <Text style={styles.headerBtnText}>📤 Share</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={styles.closeBtn} onPress={onClose} activeOpacity={0.7}>
-            <Text style={styles.closeBtnText}>✕ Close</Text>
-          </TouchableOpacity>
         </View>
       </View>
 
@@ -1013,17 +1041,40 @@ const styles = StyleSheet.create({
     backgroundColor: '#0b0f19',
   },
   header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
     backgroundColor: '#0f172a',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 8,
     borderBottomWidth: 1,
     borderBottomColor: '#1e293b',
   },
+  headerMainRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  backCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#1e293b',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 10,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  backCloseIcon: {
+    color: '#f8fafc',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  headerTitleBox: {
+    flex: 1,
+    marginRight: 10,
+  },
   fileName: {
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '700',
     color: '#f8fafc',
   },
@@ -1031,6 +1082,79 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#94a3b8',
     marginTop: 2,
+  },
+  shareBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#1e293b',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  shareIconText: {
+    fontSize: 16,
+  },
+  subToolbar: {
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(51, 65, 85, 0.4)',
+  },
+  toolbarContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  toolPill: {
+    backgroundColor: '#1e293b',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  toolPillActive: {
+    backgroundColor: '#0284c7',
+    borderColor: '#38bdf8',
+  },
+  toolPillText: {
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  toolPillTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  fontScaleGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1e293b',
+    borderRadius: 20,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  fontStepBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  fontStepText: {
+    color: '#f8fafc',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  fontScaleDisplay: {
+    color: '#38bdf8',
+    fontSize: 12,
+    fontWeight: '700',
+    paddingHorizontal: 4,
+  },
+  stepBtnDisabled: {
+    opacity: 0.35,
   },
   headerRight: {
     flexDirection: 'row',

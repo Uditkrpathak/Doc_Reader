@@ -1,3 +1,4 @@
+import { NativeEventEmitter, NativeModules } from 'react-native';
 import { ArchiveEngine } from './ArchiveEngine';
 
 export interface ActiveTrack {
@@ -17,7 +18,19 @@ class AudioPlaybackService {
   private pollInterval: NodeJS.Timeout | null = null;
   private engine = ArchiveEngine.getInstance();
 
-  private constructor() {}
+  private constructor() {
+    try {
+      if (NativeModules.ArchiveModule) {
+        const emitter = new NativeEventEmitter(NativeModules.ArchiveModule);
+        emitter.addListener('onAudioStateChanged', (data: any) => {
+          if (this.currentTrack && data && data.isPlaying === false) {
+            this.currentTrack.isPlaying = false;
+            this.notify();
+          }
+        });
+      }
+    } catch {}
+  }
 
   public static getInstance(): AudioPlaybackService {
     if (!AudioPlaybackService.instance) {

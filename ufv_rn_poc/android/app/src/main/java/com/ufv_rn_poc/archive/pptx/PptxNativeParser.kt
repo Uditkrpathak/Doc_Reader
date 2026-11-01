@@ -1015,9 +1015,10 @@ class PptxNativeParser(private val cacheDir: File) {
         val ln = spPr?.findFirstChild("ln") ?: return null
         if (ln.findFirstChild("noFill") != null) return null
 
+        // Only return a line if an explicit color is resolved under ln (prevents phantom black borders on text shapes)
+        val color = resolveColorFromContainer(ln, clrMap, clrScheme) ?: return null
         val wEMU = ln.getAttribute("w").toDoubleOrNull() ?: EMU_PER_POINT
         val widthPt = max(0.5, wEMU / EMU_PER_POINT)
-        val color = resolveColorFromContainer(ln, clrMap, clrScheme) ?: "#000000"
 
         return mapOf(
             "width" to widthPt,

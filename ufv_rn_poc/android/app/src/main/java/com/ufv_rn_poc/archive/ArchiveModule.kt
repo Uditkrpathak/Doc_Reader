@@ -89,6 +89,12 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
         fun handleIncomingIntent(context: ReactContext?, intent: Intent) {
             instance?.processIncomingIntent(intent)
         }
+
+        fun stopActivePlayback() {
+            try {
+                instance?.stopAudioInternal()
+            } catch (_: Exception) {}
+        }
     }
 
     init {
@@ -182,30 +188,47 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
             }
         }
 
-        val cleanPath = if (filePath.startsWith("file://")) filePath.substring(7) else filePath
-        val f = File(cleanPath)
-        if (f.exists() && f.isFile) return f
+        val decodedPath = try {
+            java.net.URLDecoder.decode(filePath, "UTF-8")
+        } catch (_: Exception) {
+            filePath
+        }
 
-        val fileName = f.name
+        val cleanPath = if (filePath.startsWith("file://")) filePath.substring(7) else filePath
+        val cleanDecodedPath = if (decodedPath.startsWith("file://")) decodedPath.substring(7) else decodedPath
+
+        val f1 = File(cleanDecodedPath)
+        if (f1.exists() && f1.isFile) return f1
+
+        val f2 = File(cleanPath)
+        if (f2.exists() && f2.isFile) return f2
+
         val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val candidates = listOf(
-            f,
-            File(reactContext.cacheDir, fileName),
-            File(reactContext.cacheDir, "incoming/$fileName"),
-            File(reactContext.cacheDir, "zip_extracted/$fileName"),
-            File(reactContext.cacheDir, "rar_extracted/$fileName"),
-            File(downloadDir, fileName),
-            File("/sdcard/Download", fileName),
-            File("/storage/emulated/0/Download", fileName),
-            File("/sdcard/my_test_files", fileName),
-            File("/data/local/tmp/my_test_files", fileName),
-            File("/data/local/tmp/test_assets", fileName),
-            File(reactContext.filesDir, fileName)
+            f1,
+            f2,
+            File(reactContext.cacheDir, f1.name),
+            File(reactContext.cacheDir, f2.name),
+            File(reactContext.cacheDir, "incoming/${f1.name}"),
+            File(reactContext.cacheDir, "incoming/${f2.name}"),
+            File(reactContext.cacheDir, "zip_extracted/${f1.name}"),
+            File(reactContext.cacheDir, "rar_extracted/${f1.name}"),
+            File(downloadDir, f1.name),
+            File(downloadDir, f2.name),
+            File("/sdcard/Download", f1.name),
+            File("/storage/emulated/0/Download", f1.name),
+            File("/sdcard/Download", f2.name),
+            File("/storage/emulated/0/Download", f2.name),
+            File("/sdcard/my_test_files", f1.name),
+            File("/sdcard/my_test_files", f2.name),
+            File("/data/local/tmp/my_test_files", f1.name),
+            File("/data/local/tmp/test_assets", f1.name),
+            File(reactContext.filesDir, f1.name)
         )
         for (c in candidates) {
             if (c.exists() && c.isFile) return c
         }
-        return f
+        return if (f1.exists()) f1 else f2
     }
 
     @ReactMethod
@@ -1391,23 +1414,22 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
     fun readFileBase64(filePath: String, promise: Promise) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val cleanPath = if (filePath.startsWith("file://")) filePath.substring(7) else filePath
-                val file = resolveArchiveFile(cleanPath)
-                val bytes = if (file.exists() && file.isFile) {
-                    file.readBytes()
-                } else if (filePath.startsWith("content://")) {
-                    reactContext.contentResolver.openInputStream(Uri.parse(filePath))?.use { it.readBytes() }
-                        ?: throw FileNotFoundException("Could not open content URI: $filePath")
-                } else {
-                    val cacheFile = File(reactContext.cacheDir, File(cleanPath).name)
-                    if (cacheFile.exists() && cacheFile.isFile) {
-                        cacheFile.readBytes()
-                    } else {
-                        throw FileNotFoundException("File not found: $filePath (resolved to: ${file.absolutePath})")
+                if (filePath.startsWith("content://")) {
+                    val bytes = reactContext.contentResolver.openInputStream(Uri.parse(filePath))?.use { it.readBytes() }
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                        promise.resolve(b64)
+                        return@launch
                     }
                 }
-                val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                promise.resolve(b64)
+                val file = resolveArchiveFile(filePath)
+                if (file.exists() && file.isFile) {
+                    val bytes = file.readBytes()
+                    val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                    promise.resolve(b64)
+                } else {
+                    throw FileNotFoundException("File not found: $filePath (resolved to: ${file.absolutePath})")
+                }
             } catch (t: Throwable) {
                 promise.reject("READ_FILE_ERROR", "Error reading file '$filePath': ${t.message}", t)
             }
@@ -1437,6 +1459,32 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                 }
             } catch (t: Throwable) {
                 promise.reject("DELETE_ERROR", t.message, t)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun cleanTemporaryCache(promise: Promise) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                var freedBytes = 0L
+                val cacheDir = reactContext.cacheDir
+                val files = cacheDir.listFiles()
+                if (files != null) {
+                    for (file in files) {
+                        try {
+                            val size = if (file.isDirectory) file.walkTopDown().sumOf { it.length() } else file.length()
+                            if (file.deleteRecursively()) {
+                                freedBytes += size
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                }
+                val result = Arguments.createMap()
+                result.putDouble("freedBytes", freedBytes.toDouble())
+                promise.resolve(result)
+            } catch (t: Throwable) {
+                promise.reject("CLEAN_CACHE_ERROR", t.message, t)
             }
         }
     }
@@ -1748,12 +1796,23 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                     mediaPlayer?.let { mp ->
                         if (mp.isPlaying) {
                             mp.pause()
+                            val map = Arguments.createMap()
+                            map.putString("event", "AUDIOFOCUS_LOSS")
+                            map.putBoolean("isPlaying", false)
+                            sendEvent("onAudioStateChanged", map)
                         }
                     }
                 } catch (_: Exception) {}
             }
+            android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                try {
+                    mediaPlayer?.setVolume(0.2f, 0.2f)
+                } catch (_: Exception) {}
+            }
             android.media.AudioManager.AUDIOFOCUS_GAIN -> {
-                // Focus restored
+                try {
+                    mediaPlayer?.setVolume(1.0f, 1.0f)
+                } catch (_: Exception) {}
             }
         }
     }

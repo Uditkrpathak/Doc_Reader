@@ -112,6 +112,7 @@
         android:name="com.ufv_rn_poc.video.VideoPlayerActivity"
         android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
         android:exported="true"
+        android:stopWithTask="true"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
 
       <provider
