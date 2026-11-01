@@ -157,7 +157,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
   const [isLoadingCategoryFiles, setIsLoadingCategoryFiles] = useState<boolean>(false);
   const [isPermissionBannerDismissed, setIsPermissionBannerDismissed] = useState<boolean>(false);
   const [isCleanModalVisible, setIsCleanModalVisible] = useState<boolean>(false);
-  const [isProfileModalVisible, setIsProfileModalVisible] = useState<boolean>(false);
 
   // Active viewer modal
   const [activeViewer, setActiveViewer] = useState<{
@@ -238,13 +237,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     }
     return { label: 'DOC', bg: '#64748b', isIcon: false };
   };
-
-  const greetingText = useMemo(() => {
-    const hour = new Date().getHours();
-    if (hour < 12) return 'Good morning, Alex';
-    if (hour < 17) return 'Good afternoon, Alex';
-    return 'Good evening, Alex';
-  }, []);
 
   const loadData = useCallback(() => {
     setRecentFiles(MMKV.getRecentFiles());
@@ -473,12 +465,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
             <Text style={styles.headerSearchIcon}>🔍</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.avatarButton}
-            onPress={() => setIsProfileModalVisible(true)}
-            activeOpacity={0.8}>
-            <Text style={styles.avatarText}>A</Text>
-          </TouchableOpacity>
         </View>
       </View>
 
@@ -504,13 +490,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
         </View>
       )}
 
-      {/* 2. Subheader Greeting */}
-      <View style={styles.greetingSection}>
-        <Text style={styles.greetingTitle}>{greetingText}</Text>
-        <Text style={styles.greetingSubtitle}>Your files are organized and safe</Text>
-      </View>
-
-      {/* 3. Storage Used Elevated Card */}
+      {/* Storage Used Elevated Card */}
       <View style={styles.storageCard}>
         <View style={styles.storageTopRow}>
           <View style={styles.storageIconBox}>
@@ -834,44 +814,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
         </View>
       </Modal>
 
-      {/* User Profile Modal */}
-      <Modal
-        visible={isProfileModalVisible}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setIsProfileModalVisible(false)}>
-        <View style={styles.cleanModalOverlay}>
-          <View style={styles.profileModalCard}>
-            <View style={styles.profileAvatarBig}>
-              <Text style={styles.profileAvatarBigText}>A</Text>
-            </View>
-            <Text style={styles.profileName}>Alex Pathak</Text>
-            <Text style={styles.profileStatus}>Universal File Viewer Pro • 100% Offline</Text>
-
-            <View style={styles.profileDivider} />
-
-            <View style={styles.profileInfoRow}>
-              <Text style={styles.profileInfoLabel}>Storage Used</Text>
-              <Text style={styles.profileInfoValue}>{usedGB} GB of {totalGB} GB</Text>
-            </View>
-            <View style={styles.profileInfoRow}>
-              <Text style={styles.profileInfoLabel}>Engine Status</Text>
-              <Text style={[styles.profileInfoValue, { color: '#16a34a' }]}>Active (Native C++)</Text>
-            </View>
-            <View style={styles.profileInfoRow}>
-              <Text style={styles.profileInfoLabel}>Security Mode</Text>
-              <Text style={[styles.profileInfoValue, { color: '#2563eb' }]}>Sandboxed Offline</Text>
-            </View>
-
-            <TouchableOpacity
-              style={styles.profileCloseBtn}
-              onPress={() => setIsProfileModalVisible(false)}>
-              <Text style={styles.profileCloseBtnText}>Close</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
       {/* Viewer Modal */}
       <Modal
         visible={activeViewer !== null}
@@ -1046,37 +988,6 @@ const styles = StyleSheet.create({
   },
   headerSearchIcon: {
     fontSize: 16,
-  },
-  avatarButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#3b82f6',
-    justifyContent: 'center',
-    alignItems: 'center',
-    elevation: 2,
-    shadowColor: '#3b82f6',
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-  },
-  avatarText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  greetingSection: {
-    marginBottom: 16,
-  },
-  greetingTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1e293b',
-  },
-  greetingSubtitle: {
-    fontSize: 13,
-    color: '#64748b',
-    marginTop: 2,
   },
   searchContainer: {
     flexDirection: 'row',
@@ -1512,74 +1423,6 @@ const styles = StyleSheet.create({
   },
   cleanModalBtnText: {
     color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  profileModalCard: {
-    width: '100%',
-    maxWidth: 340,
-    backgroundColor: '#ffffff',
-    borderRadius: 20,
-    padding: 24,
-    alignItems: 'center',
-    elevation: 8,
-  },
-  profileAvatarBig: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: '#3b82f6',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  profileAvatarBigText: {
-    color: '#ffffff',
-    fontSize: 26,
-    fontWeight: '800',
-  },
-  profileName: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: '#0f172a',
-  },
-  profileStatus: {
-    fontSize: 12,
-    color: '#64748b',
-    marginTop: 2,
-    marginBottom: 16,
-  },
-  profileDivider: {
-    width: '100%',
-    height: 1,
-    backgroundColor: '#f1f5f9',
-    marginBottom: 16,
-  },
-  profileInfoRow: {
-    width: '100%',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingVertical: 6,
-  },
-  profileInfoLabel: {
-    fontSize: 13,
-    color: '#64748b',
-  },
-  profileInfoValue: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#0f172a',
-  },
-  profileCloseBtn: {
-    backgroundColor: '#f1f5f9',
-    width: '100%',
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-    marginTop: 20,
-  },
-  profileCloseBtnText: {
-    color: '#334155',
     fontSize: 14,
     fontWeight: '700',
   },
