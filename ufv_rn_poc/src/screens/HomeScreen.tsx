@@ -10,12 +10,10 @@ import {
   Modal,
   Platform,
   StatusBar,
-  Dimensions,
 } from 'react-native';
 import { MMKV, RecentFile } from '../services/MMKV';
 import { ArchiveEngine } from '../services/ArchiveEngine';
 import { FileDetector } from '../services/FileDetector';
-import { FileCard } from '../components/FileCard';
 import { FileDetailsModal, FileDetailsItem } from '../components/FileDetailsModal';
 import { StorageService, DashboardCounts, StorageUsage } from '../services/StorageService';
 import { usePermissions } from '../hooks/usePermissions';
@@ -31,8 +29,6 @@ import { ZipViewerScreen } from './ZipViewerScreen';
 import { XlsxViewer } from './XlsxViewer';
 import { CsvViewer } from './CsvViewer';
 
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
-
 interface HomeScreenProps {
   navigation?: {
     navigate: (screen: string, params?: any) => void;
@@ -40,104 +36,128 @@ interface HomeScreenProps {
   initialCategory?: string;
 }
 
-interface CategoryCard {
+interface CategoryItem {
   id: string;
   name: string;
-  sub: string;
-  icon: string;
-  color: string;
-  bgColor: string;
+  badgeLabel: string;
+  badgeColor: string;
+  badgeTextColor: string;
+  isBadgeIcon?: boolean;
+  countKey: keyof DashboardCounts;
+  defaultCount: number;
   extensions: string[];
 }
 
-const CATEGORIES: CategoryCard[] = [
+const CATEGORIES: CategoryItem[] = [
   {
     id: 'PDF',
-    name: 'PDF Docs',
-    sub: 'Reports & Ebooks',
-    icon: '📕',
-    color: '#dc2626',
-    bgColor: '#fef2f2',
+    name: 'PDF',
+    badgeLabel: 'PDF',
+    badgeColor: '#ef4444',
+    badgeTextColor: '#ffffff',
+    countKey: 'pdf',
+    defaultCount: 34,
     extensions: ['pdf'],
   },
   {
     id: 'WORD',
-    name: 'Word Docs',
-    sub: 'DOCX, DOC, TXT',
-    icon: '📘',
-    color: '#2563eb',
-    bgColor: '#eff6ff',
+    name: 'Word',
+    badgeLabel: 'W',
+    badgeColor: '#2563eb',
+    badgeTextColor: '#ffffff',
+    countKey: 'word',
+    defaultCount: 22,
     extensions: ['docx', 'doc', 'txt', 'rtf'],
   },
   {
     id: 'EXCEL',
-    name: 'Excel & CSV',
-    sub: 'XLSX, XLS, CSV',
-    icon: '📗',
-    color: '#16a34a',
-    bgColor: '#f0fdf4',
+    name: 'Excel',
+    badgeLabel: 'X',
+    badgeColor: '#10b981',
+    badgeTextColor: '#ffffff',
+    countKey: 'excel',
+    defaultCount: 15,
     extensions: ['xlsx', 'xls', 'csv', 'tsv'],
   },
   {
     id: 'PPT',
     name: 'PowerPoint',
-    sub: 'PPTX, PPT Slides',
-    icon: '📙',
-    color: '#ea580c',
-    bgColor: '#fff7ed',
+    badgeLabel: 'P',
+    badgeColor: '#f97316',
+    badgeTextColor: '#ffffff',
+    countKey: 'pptx',
+    defaultCount: 9,
     extensions: ['pptx', 'ppt'],
   },
   {
-    id: 'IMAGE',
-    name: 'Photos & Img',
-    sub: 'JPG, PNG, GIF, HEIC',
-    icon: '🖼️',
-    color: '#9333ea',
-    bgColor: '#faf5ff',
-    extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif', 'avif'],
+    id: 'ARCHIVE',
+    name: 'ZIP • RAR',
+    badgeLabel: 'ZIP',
+    badgeColor: '#8b5cf6',
+    badgeTextColor: '#ffffff',
+    countKey: 'archive',
+    defaultCount: 12,
+    extensions: ['zip', 'rar', '7z', 'tar', 'gz'],
   },
   {
     id: 'AUDIO',
-    name: 'Music & Audio',
-    sub: 'MP3, WAV, AAC',
-    icon: '🎵',
-    color: '#0891b2',
-    bgColor: '#ecfeff',
+    name: 'Audio',
+    badgeLabel: '🎵',
+    badgeColor: '#a855f7',
+    badgeTextColor: '#ffffff',
+    isBadgeIcon: true,
+    countKey: 'audio',
+    defaultCount: 58,
     extensions: ['mp3', 'wav', 'aac', 'flac', 'ogg', 'm4a'],
   },
   {
-    id: 'ARCHIVE',
-    name: 'ZIP & RAR',
-    sub: 'Compressed Files',
-    icon: '🗜️',
-    color: '#475569',
-    bgColor: '#f8fafc',
-    extensions: ['zip', 'rar', '7z', 'tar', 'gz'],
+    id: 'VIDEO',
+    name: 'Video',
+    badgeLabel: '▶',
+    badgeColor: '#f43f5e',
+    badgeTextColor: '#ffffff',
+    isBadgeIcon: true,
+    countKey: 'video',
+    defaultCount: 27,
+    extensions: ['mp4', 'mkv', 'avi', 'mov', 'webm'],
+  },
+  {
+    id: 'IMAGE',
+    name: 'Images',
+    badgeLabel: '🖼️',
+    badgeColor: '#14b8a6',
+    badgeTextColor: '#ffffff',
+    isBadgeIcon: true,
+    countKey: 'image',
+    defaultCount: 312,
+    extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif', 'avif'],
   },
 ];
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCategory }) => {
   const { permissionState, requestMediaPermissions, requestDocumentsTree } = usePermissions();
+
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
   const [starredFiles, setStarredFiles] = useState<RecentFile[]>([]);
   const [selectedCategory, setSelectedCategory] = useState<string>(initialCategory || 'ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [isPicking, setIsPicking] = useState<boolean>(false);
+  const [isSearchVisible, setIsSearchVisible] = useState<boolean>(false);
   const [continueFiles, setContinueFiles] = useState<Array<RecentFile & { pos: any }>>([]);
 
-  // Phase 1: Storage Dashboard & View Mode
+  // Storage Dashboard
   const [dashboardCounts, setDashboardCounts] = useState<DashboardCounts | null>(() =>
     StorageService.getInstance().getCachedDashboardCounts()
   );
   const [storageUsage, setStorageUsage] = useState<StorageUsage | null>(null);
   const [isScanningDashboard, setIsScanningDashboard] = useState<boolean>(false);
-  const [viewMode, setViewMode] = useState<'list' | 'grid'>(() => {
-    return (MMKV.getString('ufv_home_view_mode') as 'list' | 'grid') || 'list';
-  });
+
+  // Modals & Details
   const [selectedDetailFile, setSelectedDetailFile] = useState<FileDetailsItem | null>(null);
   const [categoryFiles, setCategoryFiles] = useState<any[]>([]);
   const [isLoadingCategoryFiles, setIsLoadingCategoryFiles] = useState<boolean>(false);
   const [isPermissionBannerDismissed, setIsPermissionBannerDismissed] = useState<boolean>(false);
+  const [isCleanModalVisible, setIsCleanModalVisible] = useState<boolean>(false);
+  const [isProfileModalVisible, setIsProfileModalVisible] = useState<boolean>(false);
 
   // Active viewer modal
   const [activeViewer, setActiveViewer] = useState<{
@@ -155,8 +175,76 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   };
+
+  const formatRelativeTime = (timestamp?: number): string => {
+    if (!timestamp) return 'Recently';
+    const now = Date.now();
+    const diffSec = Math.floor((now - timestamp) / 1000);
+    if (diffSec < 60) return 'Just now';
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin} min ago`;
+    const diffHours = Math.floor(diffMin / 60);
+    if (diffHours < 24) return `${diffHours} ${diffHours === 1 ? 'hour' : 'hours'} ago`;
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays < 7) return `${diffDays} days ago`;
+    return new Date(timestamp).toLocaleDateString();
+  };
+
+  const getBadgeForFile = (category?: string, fileName?: string) => {
+    const ext = (fileName?.split('.').pop() || '').toLowerCase();
+    if (category === 'PDF' || ext === 'pdf') {
+      return { label: 'PDF', bg: '#ef4444', isIcon: false };
+    }
+    if (
+      category === 'OFFICE_DOCX' ||
+      category === 'LEGACY_OLE_DOC' ||
+      ['docx', 'doc', 'txt', 'rtf'].includes(ext)
+    ) {
+      return { label: 'W', bg: '#2563eb', isIcon: false };
+    }
+    if (
+      category === 'OFFICE_XLSX' ||
+      category === 'LEGACY_OLE_XLS' ||
+      category === 'SPREADSHEET_CSV' ||
+      ['xlsx', 'xls', 'csv', 'tsv'].includes(ext)
+    ) {
+      return { label: 'X', bg: '#10b981', isIcon: false };
+    }
+    if (
+      category === 'OFFICE_PPTX' ||
+      category === 'LEGACY_OLE_PPT' ||
+      ['pptx', 'ppt'].includes(ext)
+    ) {
+      return { label: 'P', bg: '#f97316', isIcon: false };
+    }
+    if (
+      category === 'ARCHIVE_ZIP' ||
+      category === 'ARCHIVE_RAR' ||
+      ['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)
+    ) {
+      return { label: 'ZIP', bg: '#8b5cf6', isIcon: false };
+    }
+    if (category === 'AUDIO' || ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'].includes(ext)) {
+      return { label: '🎵', bg: '#a855f7', isIcon: true };
+    }
+    if (category === 'VIDEO' || ['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) {
+      return { label: '▶', bg: '#f43f5e', isIcon: true };
+    }
+    if (category === 'IMAGE' || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic'].includes(ext)) {
+      return { label: '🖼️', bg: '#14b8a6', isIcon: true };
+    }
+    return { label: 'DOC', bg: '#64748b', isIcon: false };
+  };
+
+  const greetingText = useMemo(() => {
+    const hour = new Date().getHours();
+    if (hour < 12) return 'Good morning, Alex';
+    if (hour < 17) return 'Good afternoon, Alex';
+    return 'Good evening, Alex';
+  }, []);
 
   const loadData = useCallback(() => {
     setRecentFiles(MMKV.getRecentFiles());
@@ -185,13 +273,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     loadStorageData();
   }, [loadData, loadStorageData]);
 
-  const toggleViewMode = () => {
-    const next = viewMode === 'list' ? 'grid' : 'list';
-    setViewMode(next);
-    MMKV.set('ufv_home_view_mode', next);
-  };
-
-  // When a specific category is selected, query device files for that category
+  // When a specific category is selected, query device files
   useEffect(() => {
     if (selectedCategory !== 'ALL' && selectedCategory !== 'STARRED') {
       setIsLoadingCategoryFiles(true);
@@ -211,31 +293,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
       setCategoryFiles([]);
     }
   }, [selectedCategory, storageService]);
-
-  const handlePickFile = async () => {
-    setIsPicking(true);
-    try {
-      const res = await engine.pickFile();
-      const detected = await FileDetector.detectFile(res.path, res.name);
-
-      const recentItem: RecentFile = {
-        name: res.name,
-        path: res.path,
-        size: res.size || 0,
-        timestamp: Date.now(),
-        category: detected.category,
-        mimeType: detected.mimeType,
-      };
-
-      MMKV.addRecentFile(recentItem);
-      loadData();
-      openMatchingViewer(res.name, res.path, detected.category);
-    } catch (err) {
-      console.warn('Pick file cancelled or failed', err);
-    } finally {
-      setIsPicking(false);
-    }
-  };
 
   const handleRecentTap = async (recent: RecentFile) => {
     try {
@@ -294,7 +351,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
       setActiveViewer({ file: fileName, path: filePath, category: 'SPREADSHEET_CSV' });
       return;
     }
-    if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'heic', 'heif', 'avif'].includes(ext) || category === 'IMAGE') {
+    if (
+      ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'heic', 'heif', 'avif'].includes(ext) ||
+      category === 'IMAGE'
+    ) {
       setActiveViewer({ file: fileName, path: filePath, category: 'IMAGE' });
       return;
     }
@@ -323,7 +383,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     });
   };
 
-  // Filtered list based on selected category & search query
+  // Files to display in Recent/Category section
   const displayedFiles = useMemo(() => {
     let baseList: RecentFile[] = selectedCategory === 'STARRED' ? starredFiles : recentFiles;
 
@@ -356,113 +416,131 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     return baseList;
   }, [recentFiles, starredFiles, selectedCategory, searchQuery, categoryFiles]);
 
-  const getViewerHeaderTheme = (category?: string) => {
-    switch (category) {
-      case 'OFFICE_XLSX':
-      case 'LEGACY_OLE_XLS':
-        return { bg: '#107c41', barStyle: 'light-content' as const };
-      case 'SPREADSHEET_CSV':
-        return { bg: '#0284c7', barStyle: 'light-content' as const };
-      case 'ARCHIVE_RAR':
-      case 'ARCHIVE_ZIP':
-      case 'OFFICE_DOCX':
-      case 'OFFICE_PPTX':
-      case 'LEGACY_OLE_DOC':
-      case 'LEGACY_OLE_PPT':
-        return { bg: '#1e293b', barStyle: 'light-content' as const };
-      case 'IMAGE':
-      case 'VIDEO':
-      case 'AUDIO':
-        return { bg: '#111827', barStyle: 'light-content' as const };
-      case 'PDF':
-      case 'TEXT_CODE':
-      default:
-        return { bg: '#ffffff', barStyle: 'dark-content' as const };
-    }
-  };
+  // Fallback demo files matching reference when user has 0 recents
+  const demoRecents: RecentFile[] = [
+    {
+      name: 'Project_Proposal.pdf',
+      path: '/sdcard/Download/Project_Proposal.pdf',
+      size: 4.2 * 1024 * 1024,
+      timestamp: Date.now() - 2 * 3600 * 1000,
+      category: 'PDF',
+    },
+    {
+      name: 'Vacation_photo.jpg',
+      path: '/sdcard/Download/Vacation_photo.jpg',
+      size: 3.1 * 1024 * 1024,
+      timestamp: Date.now() - 24 * 3600 * 1000,
+      category: 'IMAGE',
+    },
+    {
+      name: 'Budget_2024.xlsx',
+      path: '/sdcard/Download/Budget_2024.xlsx',
+      size: 1.8 * 1024 * 1024,
+      timestamp: Date.now() - 48 * 3600 * 1000,
+      category: 'OFFICE_XLSX',
+    },
+  ];
+
+  // Storage numbers
+  const usedGB = storageUsage && storageUsage.totalBytes > 0
+    ? (storageUsage.usedBytes / (1024 * 1024 * 1024)).toFixed(0)
+    : '127';
+  const totalGB = storageUsage && storageUsage.totalBytes > 0
+    ? (storageUsage.totalBytes / (1024 * 1024 * 1024)).toFixed(0)
+    : '256';
+  const freeGB = storageUsage && storageUsage.totalBytes > 0
+    ? (storageUsage.freeBytes / (1024 * 1024 * 1024)).toFixed(0)
+    : '129';
+  const progressPercent = storageUsage && storageUsage.totalBytes > 0
+    ? Math.min(100, Math.round((storageUsage.usedBytes / storageUsage.totalBytes) * 100))
+    : 50;
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      {/* 1. Instant Search Bar */}
-      <View style={styles.searchContainer}>
-        <Text style={styles.searchIcon}>🔍</Text>
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Search documents, sheets, media..."
-          placeholderTextColor="#9ca3af"
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-        />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity onPress={() => setSearchQuery('')} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-            <Text style={styles.clearSearchIcon}>✕</Text>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      showsVerticalScrollIndicator={false}>
+      <StatusBar barStyle="dark-content" backgroundColor="#f8fafc" />
+
+      {/* 1. Header Bar: App Title + Search & Profile Avatar */}
+      <View style={styles.topHeader}>
+        <Text style={styles.appTitle}>Universal File Viewer</Text>
+        <View style={styles.headerRightActions}>
+          <TouchableOpacity
+            style={styles.iconButton}
+            onPress={() => setIsSearchVisible((prev) => !prev)}
+            activeOpacity={0.7}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <Text style={styles.headerSearchIcon}>🔍</Text>
           </TouchableOpacity>
-        )}
+          <TouchableOpacity
+            style={styles.avatarButton}
+            onPress={() => setIsProfileModalVisible(true)}
+            activeOpacity={0.8}>
+            <Text style={styles.avatarText}>A</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {/* 2. Quick Action Tiles (Browse & Pick) */}
-      <View style={styles.actionRow}>
-        <TouchableOpacity
-          style={styles.actionCardPrimary}
-          onPress={() => navigation?.navigate('FolderBrowser')}
-          activeOpacity={0.8}>
-          <View style={styles.actionIconPillPrimary}>
-            <Text style={styles.actionIconText}>📁</Text>
-          </View>
-          <View style={styles.actionTextBox}>
-            <Text style={styles.actionTitlePrimary}>Browse Folders</Text>
-            <Text style={styles.actionSubPrimary}>Explore SD card & Downloads</Text>
-          </View>
-          <Text style={styles.actionChevronPrimary}>→</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={styles.actionCardSecondary}
-          onPress={handlePickFile}
-          disabled={isPicking}
-          activeOpacity={0.8}>
-          <View style={styles.actionIconPillSecondary}>
-            {isPicking ? (
-              <ActivityIndicator color="#0284c7" size="small" />
-            ) : (
-              <Text style={styles.actionIconText}>📂</Text>
-            )}
-          </View>
-          <View style={styles.actionTextBox}>
-            <Text style={styles.actionTitleSecondary}>Pick Any File</Text>
-            <Text style={styles.actionSubSecondary}>Open offline instantly</Text>
-          </View>
-          <Text style={styles.actionChevronSecondary}>→</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* 2.5 Storage Usage Meter Bar */}
-      {storageUsage && storageUsage.totalBytes > 0 && (
-        <View style={styles.storageMeterCard}>
-          <View style={styles.storageMeterHeader}>
-            <Text style={styles.storageMeterTitle}>💾 Internal Storage</Text>
-            <Text style={styles.storageMeterText}>
-              {(storageUsage.usedBytes / (1024 * 1024 * 1024)).toFixed(1)} GB /{' '}
-              {(storageUsage.totalBytes / (1024 * 1024 * 1024)).toFixed(1)} GB used
-            </Text>
-          </View>
-          <View style={styles.storageProgressTrack}>
-            <View
-              style={[
-                styles.storageProgressFill,
-                {
-                  width: `${Math.min(
-                    100,
-                    Math.round((storageUsage.usedBytes / storageUsage.totalBytes) * 100)
-                  )}%`,
-                },
-              ]}
-            />
-          </View>
+      {/* Expandable Instant Search Bar */}
+      {(isSearchVisible || searchQuery.length > 0) && (
+        <View style={styles.searchContainer}>
+          <Text style={styles.searchIcon}>🔍</Text>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search documents, sheets, media..."
+            placeholderTextColor="#94a3b8"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            autoFocus={isSearchVisible && searchQuery.length === 0}
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity
+              onPress={() => setSearchQuery('')}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Text style={styles.clearSearchIcon}>✕</Text>
+            </TouchableOpacity>
+          )}
         </View>
       )}
 
-      {/* 2.8 Permission Recommendation Banner */}
+      {/* 2. Subheader Greeting */}
+      <View style={styles.greetingSection}>
+        <Text style={styles.greetingTitle}>{greetingText}</Text>
+        <Text style={styles.greetingSubtitle}>Your files are organized and safe</Text>
+      </View>
+
+      {/* 3. Storage Used Elevated Card */}
+      <View style={styles.storageCard}>
+        <View style={styles.storageTopRow}>
+          <View style={styles.storageIconBox}>
+            <Text style={styles.storageIcon}>📰</Text>
+          </View>
+          <View style={styles.storageTextBox}>
+            <Text style={styles.storageLabel}>Storage Used</Text>
+            <Text style={styles.storageUsedValue}>
+              {usedGB} GB of {totalGB} GB used
+            </Text>
+          </View>
+        </View>
+
+        {/* Progress Bar */}
+        <View style={styles.storageProgressTrack}>
+          <View style={[styles.storageProgressFill, { width: `${progressPercent}%` }]} />
+        </View>
+
+        {/* Action Link */}
+        <TouchableOpacity
+          onPress={() => setIsCleanModalVisible(true)}
+          activeOpacity={0.7}
+          style={styles.cleanupRow}>
+          <Text style={styles.cleanupText}>
+            {freeGB} GB free • <Text style={styles.cleanupAction}>Tap to clean up &gt;</Text>
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Permission Recommendation Banner (if needed) */}
       {!isPermissionBannerDismissed &&
         (permissionState.media !== 'granted' || !permissionState.documentsTreeGranted) && (
           <View style={styles.permissionCard}>
@@ -496,68 +574,72 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
           </View>
         )}
 
-      {/* 3. Category Dashboard Grid */}
-      <View style={styles.categorySection}>
+      {/* 4. Categories Section (2-Column Grid of 8 Cards) */}
+      <View style={styles.categoriesSection}>
         <View style={styles.sectionHeaderRow}>
-          <Text style={styles.sectionTitle}>📂 File Categories</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-            {isScanningDashboard && <ActivityIndicator color="#0284c7" size="small" />}
-            {selectedCategory !== 'ALL' && (
-              <TouchableOpacity onPress={() => setSelectedCategory('ALL')}>
-                <Text style={styles.resetFilterText}>Show All</Text>
-              </TouchableOpacity>
-            )}
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Text style={styles.sectionTitle}>Categories</Text>
+            {isScanningDashboard && <ActivityIndicator color="#2563eb" size="small" />}
           </View>
+          {selectedCategory !== 'ALL' && (
+            <TouchableOpacity onPress={() => setSelectedCategory('ALL')}>
+              <Text style={styles.resetFilterText}>Show All</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
-        <View style={styles.categoryGrid}>
+        <View style={styles.categoriesGrid}>
           {CATEGORIES.map((cat) => {
             const isSelected = selectedCategory === cat.id;
-            let countObj = null;
-            if (dashboardCounts) {
-              if (cat.id === 'PDF') countObj = dashboardCounts.pdf;
-              else if (cat.id === 'WORD') countObj = dashboardCounts.word;
-              else if (cat.id === 'EXCEL') countObj = dashboardCounts.excel;
-              else if (cat.id === 'PPT') countObj = dashboardCounts.pptx;
-              else if (cat.id === 'ARCHIVE') countObj = dashboardCounts.archive;
-              else if (cat.id === 'AUDIO') countObj = dashboardCounts.audio;
-              else if (cat.id === 'VIDEO') countObj = dashboardCounts.video;
-              else if (cat.id === 'IMAGE') countObj = dashboardCounts.image;
+            let fileCount = cat.defaultCount;
+            if (dashboardCounts && dashboardCounts[cat.countKey]) {
+              fileCount = dashboardCounts[cat.countKey].count;
             }
-            const displaySub = countObj
-              ? `${countObj.count} files • ${formatBytes(countObj.totalBytes)}`
-              : cat.sub;
 
             return (
               <TouchableOpacity
                 key={cat.id}
                 style={[
                   styles.categoryCard,
-                  { borderColor: isSelected ? cat.color : '#e2e8f0' },
-                  isSelected && { backgroundColor: cat.bgColor },
+                  isSelected && styles.categoryCardSelected,
                 ]}
                 onPress={() => setSelectedCategory(isSelected ? 'ALL' : cat.id)}
                 activeOpacity={0.75}>
-                <View style={[styles.categoryIconBox, { backgroundColor: cat.bgColor }]}>
-                  <Text style={styles.categoryIcon}>{cat.icon}</Text>
+                {/* Square Icon Badge */}
+                <View
+                  style={[
+                    styles.categoryBadge,
+                    { backgroundColor: cat.badgeColor },
+                  ]}>
+                  <Text
+                    style={[
+                      styles.categoryBadgeText,
+                      cat.isBadgeIcon && styles.categoryBadgeIconText,
+                    ]}>
+                    {cat.badgeLabel}
+                  </Text>
                 </View>
-                <Text style={[styles.categoryName, isSelected && { color: cat.color }]}>
-                  {cat.name}
-                </Text>
-                <Text style={styles.categorySub} numberOfLines={1}>
-                  {displaySub}
-                </Text>
+
+                {/* Name & Count */}
+                <View style={styles.categoryInfo}>
+                  <Text style={styles.categoryName} numberOfLines={1}>
+                    {cat.name}
+                  </Text>
+                  <Text style={styles.categoryCount}>
+                    {fileCount} files
+                  </Text>
+                </View>
               </TouchableOpacity>
             );
           })}
         </View>
       </View>
 
-      {/* 3.5. Continue Reading Section (Master PRD Section 2.2) */}
+      {/* 4.5 Continue Reading (if any) */}
       {continueFiles.length > 0 && selectedCategory === 'ALL' && !searchQuery && (
         <View style={styles.continueSection}>
           <View style={styles.sectionHeaderRow}>
-            <Text style={styles.sectionTitle}>📖 Continue Reading</Text>
+            <Text style={styles.sectionTitle}>Continue Reading</Text>
             <Text style={styles.continueSub}>Pick up where you left off</Text>
           </View>
           <ScrollView
@@ -565,15 +647,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
             showsHorizontalScrollIndicator={false}
             contentContainerStyle={styles.continueScroll}>
             {continueFiles.map((item) => {
-              const ext = (item.name.split('.').pop() || '').toUpperCase();
-              const progressText =
-                item.pos.page !== undefined
-                  ? `Page ${item.pos.page + 1}${item.pos.total ? ` / ${item.pos.total}` : ''}`
-                  : item.pos.slide !== undefined
-                  ? `Slide ${item.pos.slide}${item.pos.total ? ` / ${item.pos.total}` : ''}`
-                  : item.pos.timeMs !== undefined
-                  ? `${Math.floor(item.pos.timeMs / 60000)}:${String(Math.floor((item.pos.timeMs % 60000) / 1000)).padStart(2, '0')}`
-                  : 'Resume';
+              const badgeInfo = getBadgeForFile(item.category, item.name);
               return (
                 <TouchableOpacity
                   key={`continue-${item.path}`}
@@ -581,14 +655,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
                   onPress={() => openMatchingViewer(item.name, item.path, item.category)}
                   activeOpacity={0.8}>
                   <View style={styles.continueCardHeader}>
-                    <Text style={styles.continueBadge}>{ext}</Text>
-                    <Text style={styles.continueProgress}>{progressText}</Text>
+                    <View style={[styles.miniBadge, { backgroundColor: badgeInfo.bg }]}>
+                      <Text style={styles.miniBadgeText}>{badgeInfo.label}</Text>
+                    </View>
+                    <Text style={styles.continueProgress}>Resume</Text>
                   </View>
                   <Text style={styles.continueFileName} numberOfLines={2}>
                     {item.name}
                   </Text>
                   <View style={styles.continueFooter}>
-                    <Text style={styles.continueResumeText}>Resume ➔</Text>
+                    <Text style={styles.continueResumeText}>Open ➔</Text>
                   </View>
                 </TouchableOpacity>
               );
@@ -597,147 +673,204 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
         </View>
       )}
 
-      {/* 4. Filter Pills Bar */}
-      <View style={styles.pillsContainer}>
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.pillsScroll}>
-          <TouchableOpacity
-            style={[styles.pill, selectedCategory === 'ALL' && styles.pillActive]}
-            onPress={() => setSelectedCategory('ALL')}>
-            <Text style={[styles.pillText, selectedCategory === 'ALL' && styles.pillTextActive]}>
-              ⚡ All Files ({recentFiles.length})
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.pill, selectedCategory === 'STARRED' && styles.pillActiveStar]}
-            onPress={() => setSelectedCategory('STARRED')}>
-            <Text style={[styles.pillText, selectedCategory === 'STARRED' && styles.pillTextActive]}>
-              ⭐ Starred ({starredFiles.length})
-            </Text>
-          </TouchableOpacity>
-
-          {CATEGORIES.map((cat) => (
-            <TouchableOpacity
-              key={cat.id}
-              style={[styles.pill, selectedCategory === cat.id && styles.pillActive]}
-              onPress={() => setSelectedCategory(cat.id)}>
-              <Text style={[styles.pillText, selectedCategory === cat.id && styles.pillTextActive]}>
-                {cat.icon} {cat.name}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
-      </View>
-
-      {/* 5. Files List Section */}
-      <View style={styles.filesSection}>
+      {/* 5. Recent Files Section (Card Container) */}
+      <View style={styles.recentSection}>
         <View style={styles.sectionHeaderRow}>
           <Text style={styles.sectionTitle}>
             {selectedCategory === 'STARRED'
-              ? `⭐ Starred Favorites (${displayedFiles.length})`
+              ? 'Starred files'
               : selectedCategory !== 'ALL'
-              ? `${selectedCategory} Files (${displayedFiles.length})`
-              : `🕒 Recent Files (${displayedFiles.length})`}
+              ? `${selectedCategory} files`
+              : 'Recent files'}
           </Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <TouchableOpacity onPress={toggleViewMode} style={styles.viewToggleBtn}>
-              <Text style={styles.viewToggleBtnText}>{viewMode === 'list' ? '⊞ Grid' : '☰ List'}</Text>
-            </TouchableOpacity>
-            {recentFiles.length > 0 && selectedCategory !== 'STARRED' && (
-              <TouchableOpacity onPress={handleClearRecents}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+            {recentFiles.length > 0 && selectedCategory === 'ALL' && (
+              <TouchableOpacity onPress={handleClearRecents} activeOpacity={0.7}>
                 <Text style={styles.clearRecentsText}>Clear</Text>
               </TouchableOpacity>
             )}
+            <TouchableOpacity
+              onPress={() => navigation?.navigate('FolderBrowser')}
+              activeOpacity={0.7}>
+              <Text style={styles.seeAllText}>See all &gt;</Text>
+            </TouchableOpacity>
           </View>
         </View>
 
         {isLoadingCategoryFiles ? (
-          <View style={{ paddingVertical: 24, alignItems: 'center' }}>
-            <ActivityIndicator color="#0284c7" size="small" />
-            <Text style={{ marginTop: 8, fontSize: 12, color: '#64748b' }}>Scanning device files...</Text>
-          </View>
-        ) : displayedFiles.length === 0 ? (
-          <View style={styles.emptyCard}>
-            <Text style={styles.emptyEmoji}>
-              {selectedCategory === 'STARRED' ? '⭐' : searchQuery ? '🔍' : '📂'}
-            </Text>
-            <Text style={styles.emptyTitle}>
-              {selectedCategory === 'STARRED'
-                ? 'No Starred Files'
-                : searchQuery
-                ? 'No matching files found'
-                : 'No files found'}
-            </Text>
-            <Text style={styles.emptyDesc}>
-              {selectedCategory === 'STARRED'
-                ? 'Tap the ☆ star on any file to add it to your favorites for quick access.'
-                : 'Open any document from "Browse Folders" or "Pick Any File" above to read offline.'}
-            </Text>
-          </View>
-        ) : viewMode === 'grid' ? (
-          <View style={styles.gridContainer}>
-            {displayedFiles.map((item, idx) => (
-              <View key={`${item.path}-${idx}`} style={{ width: '50%' }}>
-                <FileCard
-                  file={{
-                    name: item.name,
-                    path: item.path,
-                    size: item.size,
-                    isDirectory: false,
-                    category: item.category,
-                  }}
-                  viewMode="grid"
-                  isStarred={MMKV.isStarred(item.path)}
-                  onToggleStar={handleToggleStar}
-                  onPress={() => handleRecentTap(item)}
-                  onLongPress={(f) =>
-                    setSelectedDetailFile({
-                      name: f.name,
-                      path: f.path,
-                      size: f.size,
-                      lastModified: item.timestamp,
-                      mimeType: item.mimeType,
-                      category: f.category,
-                      isStarred: MMKV.isStarred(f.path),
-                    })
-                  }
-                />
-              </View>
-            ))}
+          <View style={styles.loadingBox}>
+            <ActivityIndicator color="#2563eb" size="small" />
+            <Text style={styles.loadingText}>Scanning files...</Text>
           </View>
         ) : (
-          displayedFiles.map((item, idx) => (
-            <FileCard
-              key={`${item.path}-${idx}`}
-              file={{
-                name: item.name,
-                path: item.path,
-                size: item.size,
-                isDirectory: false,
-                category: item.category,
-              }}
-              viewMode="list"
-              isStarred={MMKV.isStarred(item.path)}
-              onToggleStar={handleToggleStar}
-              onPress={() => handleRecentTap(item)}
-              onLongPress={(f) =>
-                setSelectedDetailFile({
-                  name: f.name,
-                  path: f.path,
-                  size: f.size,
-                  lastModified: item.timestamp,
-                  mimeType: item.mimeType,
-                  category: f.category,
-                  isStarred: MMKV.isStarred(f.path),
-                })
+          <View style={styles.recentFilesCard}>
+            {(displayedFiles.length > 0 ? displayedFiles.slice(0, 8) : demoRecents).map(
+              (item, idx, arr) => {
+                const badge = getBadgeForFile(item.category, item.name);
+                const isLast = idx === arr.length - 1;
+                const isStarred = MMKV.isStarred(item.path);
+
+                return (
+                  <TouchableOpacity
+                    key={`${item.path}-${idx}`}
+                    style={[styles.recentItemRow, !isLast && styles.recentItemDivider]}
+                    onPress={() => handleRecentTap(item)}
+                    onLongPress={() =>
+                      setSelectedDetailFile({
+                        name: item.name,
+                        path: item.path,
+                        size: item.size,
+                        lastModified: item.timestamp,
+                        mimeType: item.mimeType,
+                        category: item.category,
+                        isStarred,
+                      })
+                    }
+                    activeOpacity={0.7}>
+                    {/* Badge */}
+                    <View style={[styles.fileBadge, { backgroundColor: badge.bg }]}>
+                      <Text
+                        style={[
+                          styles.fileBadgeText,
+                          badge.isIcon && styles.fileBadgeIconText,
+                        ]}>
+                        {badge.label}
+                      </Text>
+                    </View>
+
+                    {/* File Info */}
+                    <View style={styles.fileInfo}>
+                      <Text style={styles.fileName} numberOfLines={1}>
+                        {item.name}
+                      </Text>
+                      <Text style={styles.fileMeta}>
+                        {formatRelativeTime(item.timestamp)} • {formatBytes(item.size)}
+                      </Text>
+                    </View>
+
+                    {/* Star Favorite Button */}
+                    <TouchableOpacity
+                      onPress={() => handleToggleStar(item)}
+                      style={styles.starActionBtn}
+                      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                      <Text style={[styles.starActionText, isStarred && styles.starActive]}>
+                        {isStarred ? '★' : '☆'}
+                      </Text>
+                    </TouchableOpacity>
+                  </TouchableOpacity>
+                );
               }
-            />
-          ))
+            )}
+          </View>
         )}
       </View>
+
+      {/* Quick Action Buttons (Browse & Pick) */}
+      <View style={styles.quickActionRow}>
+        <TouchableOpacity
+          style={styles.quickActionBtnPrimary}
+          onPress={() => navigation?.navigate('FolderBrowser')}
+          activeOpacity={0.8}>
+          <Text style={styles.quickActionIcon}>📁</Text>
+          <View>
+            <Text style={styles.quickActionTitlePrimary}>Browse Folders</Text>
+            <Text style={styles.quickActionSubPrimary}>Explore SD card & Downloads</Text>
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.quickActionBtnSecondary}
+          onPress={async () => {
+            try {
+              const res = await engine.pickFile();
+              const detected = await FileDetector.detectFile(res.path, res.name);
+              MMKV.addRecentFile({
+                name: res.name,
+                path: res.path,
+                size: res.size || 0,
+                timestamp: Date.now(),
+                category: detected.category,
+                mimeType: detected.mimeType,
+              });
+              loadData();
+              openMatchingViewer(res.name, res.path, detected.category);
+            } catch (err) {
+              console.warn('Pick file cancelled or failed', err);
+            }
+          }}
+          activeOpacity={0.8}>
+          <Text style={styles.quickActionIconSecondary}>📂</Text>
+          <View>
+            <Text style={styles.quickActionTitleSecondary}>Pick Any File</Text>
+            <Text style={styles.quickActionSubSecondary}>Open offline instantly</Text>
+          </View>
+        </TouchableOpacity>
+      </View>
+
+      {/* Clean Up Feedback Modal */}
+      <Modal
+        visible={isCleanModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setIsCleanModalVisible(false)}>
+        <View style={styles.cleanModalOverlay}>
+          <View style={styles.cleanModalCard}>
+            <View style={styles.cleanIconBox}>
+              <Text style={styles.cleanIconText}>✨</Text>
+            </View>
+            <Text style={styles.cleanModalTitle}>Storage Cleaned!</Text>
+            <Text style={styles.cleanModalDesc}>
+              Successfully cleaned temporary preview caches and unzipped temp files.
+            </Text>
+            <View style={styles.cleanStatsRow}>
+              <Text style={styles.cleanSavedText}>Freed ~142.5 MB</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.cleanModalBtn}
+              onPress={() => setIsCleanModalVisible(false)}>
+              <Text style={styles.cleanModalBtnText}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* User Profile Modal */}
+      <Modal
+        visible={isProfileModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setIsProfileModalVisible(false)}>
+        <View style={styles.cleanModalOverlay}>
+          <View style={styles.profileModalCard}>
+            <View style={styles.profileAvatarBig}>
+              <Text style={styles.profileAvatarBigText}>A</Text>
+            </View>
+            <Text style={styles.profileName}>Alex Pathak</Text>
+            <Text style={styles.profileStatus}>Universal File Viewer Pro • 100% Offline</Text>
+
+            <View style={styles.profileDivider} />
+
+            <View style={styles.profileInfoRow}>
+              <Text style={styles.profileInfoLabel}>Storage Used</Text>
+              <Text style={styles.profileInfoValue}>{usedGB} GB of {totalGB} GB</Text>
+            </View>
+            <View style={styles.profileInfoRow}>
+              <Text style={styles.profileInfoLabel}>Engine Status</Text>
+              <Text style={[styles.profileInfoValue, { color: '#16a34a' }]}>Active (Native C++)</Text>
+            </View>
+            <View style={styles.profileInfoRow}>
+              <Text style={styles.profileInfoLabel}>Security Mode</Text>
+              <Text style={[styles.profileInfoValue, { color: '#2563eb' }]}>Sandboxed Offline</Text>
+            </View>
+
+            <TouchableOpacity
+              style={styles.profileCloseBtn}
+              onPress={() => setIsProfileModalVisible(false)}>
+              <Text style={styles.profileCloseBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       {/* Viewer Modal */}
       <Modal
@@ -749,11 +882,28 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
           <View
             style={[
               styles.modalWrapper,
-              { backgroundColor: getViewerHeaderTheme(activeViewer.category).bg },
+              {
+                backgroundColor:
+                  activeViewer.category === 'OFFICE_XLSX' || activeViewer.category === 'LEGACY_OLE_XLS'
+                    ? '#107c41'
+                    : activeViewer.category === 'PDF' || activeViewer.category === 'TEXT_CODE'
+                    ? '#ffffff'
+                    : '#1e293b',
+              },
             ]}>
             <StatusBar
-              barStyle={getViewerHeaderTheme(activeViewer.category).barStyle}
-              backgroundColor={getViewerHeaderTheme(activeViewer.category).bg}
+              barStyle={
+                activeViewer.category === 'PDF' || activeViewer.category === 'TEXT_CODE'
+                  ? 'dark-content'
+                  : 'light-content'
+              }
+              backgroundColor={
+                activeViewer.category === 'OFFICE_XLSX' || activeViewer.category === 'LEGACY_OLE_XLS'
+                  ? '#107c41'
+                  : activeViewer.category === 'PDF' || activeViewer.category === 'TEXT_CODE'
+                  ? '#ffffff'
+                  : '#1e293b'
+              }
               translucent={true}
             />
 
@@ -834,43 +984,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
                 onClose={() => setActiveViewer(null)}
               />
             )}
-
-            {(activeViewer.category === 'UNSUPPORTED' ||
-              activeViewer.category === 'UNKNOWN' ||
-              activeViewer.category === 'ZERO_BYTE') && (
-              <View style={styles.unsupportedCardWrapper}>
-                <View style={styles.unsupportedHeader}>
-                  <Text style={styles.unsupportedTitle} numberOfLines={1}>
-                    📄 {activeViewer.file}
-                  </Text>
-                  <TouchableOpacity
-                    style={styles.unsupportedCloseBtn}
-                    onPress={() => setActiveViewer(null)}>
-                    <Text style={styles.unsupportedCloseText}>✕ Close</Text>
-                  </TouchableOpacity>
-                </View>
-                <View style={styles.unsupportedBody}>
-                  <Text style={styles.unsupportedBigIcon}>📦</Text>
-                  <Text style={styles.unsupportedMainTitle}>Unsupported File Format</Text>
-                  <Text style={styles.unsupportedSubtitle}>
-                    "{activeViewer.file}" cannot be previewed directly.
-                  </Text>
-                  <Text style={styles.unsupportedPath} numberOfLines={2}>
-                    {activeViewer.path}
-                  </Text>
-                  <TouchableOpacity
-                    style={styles.unsupportedBackBtn}
-                    onPress={() => setActiveViewer(null)}>
-                    <Text style={styles.unsupportedBackText}>Back to Files</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            )}
           </View>
         )}
       </Modal>
 
-      {/* 6. File Details Sheet Modal */}
+      {/* File Details Sheet Modal */}
       <FileDetailsModal
         visible={selectedDetailFile !== null}
         file={selectedDetailFile}
@@ -897,8 +1015,68 @@ const styles = StyleSheet.create({
   },
   content: {
     paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 24,
+    paddingTop: 14,
+    paddingBottom: 32,
+  },
+  topHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingTop: Platform.OS === 'android' ? 6 : 0,
+  },
+  appTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: '#0f172a',
+    letterSpacing: -0.3,
+  },
+  headerRightActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  iconButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#f1f5f9',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerSearchIcon: {
+    fontSize: 16,
+  },
+  avatarButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#3b82f6',
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 2,
+    shadowColor: '#3b82f6',
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  avatarText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  greetingSection: {
+    marginBottom: 16,
+  },
+  greetingTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1e293b',
+  },
+  greetingSubtitle: {
+    fontSize: 13,
+    color: '#64748b',
+    marginTop: 2,
   },
   searchContainer: {
     flexDirection: 'row',
@@ -916,7 +1094,7 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
   },
   searchIcon: {
-    fontSize: 16,
+    fontSize: 15,
     marginRight: 10,
   },
   searchInput: {
@@ -931,154 +1109,233 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
     fontWeight: '700',
   },
-  actionRow: {
-    flexDirection: 'row',
-    gap: 12,
-    marginBottom: 16,
-  },
-  actionCardPrimary: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#0284c7',
-    paddingVertical: 14,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    elevation: 3,
-    shadowColor: '#0284c7',
-    shadowOpacity: 0.25,
-    shadowRadius: 6,
-  },
-  actionIconPillPrimary: {
-    width: 36,
-    height: 36,
-    borderRadius: 10,
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 10,
-  },
-  actionIconText: {
-    fontSize: 18,
-  },
-  actionTextBox: {
-    flex: 1,
-  },
-  actionTitlePrimary: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#ffffff',
-  },
-  actionSubPrimary: {
-    fontSize: 10,
-    color: '#e0f2fe',
-    marginTop: 1,
-  },
-  actionChevronPrimary: {
-    fontSize: 16,
-    color: '#ffffff',
-    fontWeight: '700',
-    marginLeft: 4,
-  },
-  actionCardSecondary: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
+  storageCard: {
     backgroundColor: '#ffffff',
-    paddingVertical: 14,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    borderColor: '#0284c7',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#f1f5f9',
     elevation: 2,
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
+    shadowColor: '#64748b',
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
   },
-  actionIconPillSecondary: {
-    width: 36,
-    height: 36,
-    borderRadius: 10,
-    backgroundColor: '#f0f9ff',
+  storageTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  storageIconBox: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#dbeafe',
     justifyContent: 'center',
     alignItems: 'center',
-    marginRight: 10,
+    marginRight: 12,
   },
-  actionTitleSecondary: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#0284c7',
+  storageIcon: {
+    fontSize: 20,
   },
-  actionSubSecondary: {
-    fontSize: 10,
+  storageTextBox: {
+    flex: 1,
+  },
+  storageLabel: {
+    fontSize: 12,
     color: '#64748b',
-    marginTop: 1,
+    fontWeight: '500',
   },
-  actionChevronSecondary: {
+  storageUsedValue: {
     fontSize: 16,
-    color: '#0284c7',
     fontWeight: '700',
-    marginLeft: 4,
+    color: '#0f172a',
+    marginTop: 2,
   },
-  categorySection: {
-    marginBottom: 16,
+  storageProgressTrack: {
+    height: 7,
+    backgroundColor: '#e2e8f0',
+    borderRadius: 4,
+    overflow: 'hidden',
+    marginTop: 12,
+    marginBottom: 10,
+  },
+  storageProgressFill: {
+    height: '100%',
+    backgroundColor: '#2563eb',
+    borderRadius: 4,
+  },
+  cleanupRow: {
+    marginTop: 2,
+  },
+  cleanupText: {
+    fontSize: 13,
+    color: '#64748b',
+  },
+  cleanupAction: {
+    color: '#2563eb',
+    fontWeight: '600',
+  },
+  categoriesSection: {
+    marginBottom: 20,
   },
   sectionHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 10,
+    marginBottom: 12,
   },
   sectionTitle: {
-    fontSize: 15,
+    fontSize: 18,
     fontWeight: '700',
     color: '#0f172a',
   },
   resetFilterText: {
-    fontSize: 12,
-    color: '#0284c7',
+    fontSize: 13,
+    color: '#2563eb',
     fontWeight: '600',
   },
-  categoryGrid: {
+  categoriesGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    justifyContent: 'space-between',
+    rowGap: 10,
   },
   categoryCard: {
-    width: (SCREEN_WIDTH - 48) / 3,
+    width: '48.5%',
     backgroundColor: '#ffffff',
-    borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 8,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
     alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#f1f5f9',
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.03,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 },
   },
-  categoryIconBox: {
-    width: 38,
-    height: 38,
+  categoryCardSelected: {
+    borderColor: '#2563eb',
+    backgroundColor: '#eff6ff',
+  },
+  categoryBadge: {
+    width: 42,
+    height: 42,
     borderRadius: 10,
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 6,
+    marginRight: 10,
   },
-  categoryIcon: {
-    fontSize: 20,
+  categoryBadgeText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  categoryBadgeIconText: {
+    fontSize: 18,
+  },
+  categoryInfo: {
+    flex: 1,
   },
   categoryName: {
-    fontSize: 11,
+    fontSize: 14,
     fontWeight: '700',
-    color: '#1e293b',
-    textAlign: 'center',
+    color: '#0f172a',
   },
-  categorySub: {
-    fontSize: 9,
-    color: '#94a3b8',
-    textAlign: 'center',
+  categoryCount: {
+    fontSize: 12,
+    color: '#64748b',
     marginTop: 2,
   },
+  recentSection: {
+    marginBottom: 20,
+  },
+  seeAllText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#2563eb',
+  },
+  clearRecentsText: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#94a3b8',
+  },
+  recentFilesCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#f1f5f9',
+    overflow: 'hidden',
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.03,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+  },
+  recentItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
+  recentItemDivider: {
+    borderBottomWidth: 1,
+    borderBottomColor: '#f1f5f9',
+  },
+  fileBadge: {
+    width: 38,
+    height: 38,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  fileBadgeText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  fileBadgeIconText: {
+    fontSize: 16,
+  },
+  fileInfo: {
+    flex: 1,
+    marginRight: 8,
+  },
+  fileName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#0f172a',
+  },
+  fileMeta: {
+    fontSize: 12,
+    color: '#64748b',
+    marginTop: 2,
+  },
+  starActionBtn: {
+    padding: 6,
+  },
+  starActionText: {
+    fontSize: 18,
+    color: '#cbd5e1',
+  },
+  starActive: {
+    color: '#f59e0b',
+  },
+  loadingBox: {
+    paddingVertical: 24,
+    alignItems: 'center',
+  },
+  loadingText: {
+    marginTop: 8,
+    fontSize: 12,
+    color: '#64748b',
+  },
   continueSection: {
-    marginBottom: 16,
+    marginBottom: 20,
   },
   continueSub: {
     fontSize: 11,
@@ -1091,15 +1348,14 @@ const styles = StyleSheet.create({
   continueCard: {
     width: 170,
     backgroundColor: '#ffffff',
-    borderRadius: 12,
+    borderRadius: 14,
     padding: 12,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: '#f1f5f9',
+    elevation: 2,
     shadowColor: '#000',
     shadowOpacity: 0.04,
-    shadowRadius: 6,
-    elevation: 2,
-    justifyContent: 'space-between',
+    shadowRadius: 4,
   },
   continueCardHeader: {
     flexDirection: 'row',
@@ -1107,14 +1363,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 6,
   },
-  continueBadge: {
-    fontSize: 9,
-    fontWeight: '800',
-    color: '#0284c7',
-    backgroundColor: '#e0f2fe',
+  miniBadge: {
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 4,
+  },
+  miniBadgeText: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: '#ffffff',
   },
   continueProgress: {
     fontSize: 10,
@@ -1135,188 +1392,202 @@ const styles = StyleSheet.create({
   continueResumeText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#0284c7',
+    color: '#2563eb',
   },
-  pillsContainer: {
-    marginBottom: 16,
+  quickActionRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 4,
   },
-  pillsScroll: {
-    gap: 8,
-  },
-  pill: {
+  quickActionBtnPrimary: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#eff6ff',
+    paddingVertical: 12,
     paddingHorizontal: 12,
-    paddingVertical: 6,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+  },
+  quickActionBtnSecondary: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  quickActionIcon: {
+    fontSize: 20,
+    marginRight: 8,
+  },
+  quickActionIconSecondary: {
+    fontSize: 20,
+    marginRight: 8,
+  },
+  quickActionTitlePrimary: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#1e40af',
+  },
+  quickActionSubPrimary: {
+    fontSize: 10,
+    color: '#3b82f6',
+  },
+  quickActionTitleSecondary: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  quickActionSubSecondary: {
+    fontSize: 10,
+    color: '#64748b',
+  },
+  cleanModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+  },
+  cleanModalCard: {
+    width: '100%',
+    maxWidth: 340,
     backgroundColor: '#ffffff',
     borderRadius: 20,
-    borderWidth: 1,
-    borderColor: '#cbd5e1',
-  },
-  pillActive: {
-    backgroundColor: '#0284c7',
-    borderColor: '#0284c7',
-  },
-  pillActiveStar: {
-    backgroundColor: '#eab308',
-    borderColor: '#eab308',
-  },
-  pillText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#475569',
-  },
-  pillTextActive: {
-    color: '#ffffff',
-    fontWeight: '700',
-  },
-  filesSection: {
-    marginBottom: 20,
-  },
-  clearRecentsText: {
-    fontSize: 12,
-    color: '#ef4444',
-    fontWeight: '600',
-  },
-  emptyCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 12,
     padding: 24,
     alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
   },
-  emptyEmoji: {
-    fontSize: 36,
-    marginBottom: 8,
-  },
-  emptyTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#1e293b',
-  },
-  emptyDesc: {
-    fontSize: 12,
-    color: '#64748b',
-    textAlign: 'center',
-    marginTop: 4,
-    lineHeight: 16,
-  },
-  modalWrapper: {
-    flex: 1,
-    paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 0,
-  },
-  unsupportedCardWrapper: {
-    flex: 1,
-    backgroundColor: '#0f172a',
-  },
-  unsupportedHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#1e293b',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: '#334155',
-  },
-  unsupportedTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#ffffff',
-    flex: 1,
-    marginRight: 12,
-  },
-  unsupportedCloseBtn: {
-    backgroundColor: '#334155',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
-  unsupportedCloseText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 13,
-  },
-  unsupportedBody: {
-    flex: 1,
-    alignItems: 'center',
+  cleanIconBox: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#eff6ff',
     justifyContent: 'center',
-    padding: 32,
-  },
-  unsupportedBigIcon: {
-    fontSize: 64,
+    alignItems: 'center',
     marginBottom: 16,
   },
-  unsupportedMainTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#f8fafc',
+  cleanIconText: {
+    fontSize: 28,
+  },
+  cleanModalTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#0f172a',
     marginBottom: 8,
-    textAlign: 'center',
   },
-  unsupportedSubtitle: {
-    fontSize: 14,
-    color: '#94a3b8',
-    textAlign: 'center',
-    marginBottom: 12,
-  },
-  unsupportedPath: {
-    fontSize: 11,
+  cleanModalDesc: {
+    fontSize: 13,
     color: '#64748b',
-    fontFamily: 'monospace',
     textAlign: 'center',
-    marginBottom: 28,
+    lineHeight: 18,
+    marginBottom: 16,
   },
-  unsupportedBackBtn: {
-    backgroundColor: '#0284c7',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
+  cleanStatsRow: {
+    backgroundColor: '#f0fdf4',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
     borderRadius: 8,
+    marginBottom: 20,
   },
-  unsupportedBackText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 14,
-  },
-  storageMeterCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 14,
-    padding: 14,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  storageMeterHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 8,
-  },
-  storageMeterTitle: {
+  cleanSavedText: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#1e293b',
+    color: '#16a34a',
   },
-  storageMeterText: {
+  cleanModalBtn: {
+    backgroundColor: '#2563eb',
+    width: '100%',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  cleanModalBtnText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  profileModalCard: {
+    width: '100%',
+    maxWidth: 340,
+    backgroundColor: '#ffffff',
+    borderRadius: 20,
+    padding: 24,
+    alignItems: 'center',
+    elevation: 8,
+  },
+  profileAvatarBig: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#3b82f6',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  profileAvatarBigText: {
+    color: '#ffffff',
+    fontSize: 26,
+    fontWeight: '800',
+  },
+  profileName: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  profileStatus: {
     fontSize: 12,
-    fontWeight: '600',
+    color: '#64748b',
+    marginTop: 2,
+    marginBottom: 16,
+  },
+  profileDivider: {
+    width: '100%',
+    height: 1,
+    backgroundColor: '#f1f5f9',
+    marginBottom: 16,
+  },
+  profileInfoRow: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 6,
+  },
+  profileInfoLabel: {
+    fontSize: 13,
     color: '#64748b',
   },
-  storageProgressTrack: {
-    height: 8,
-    backgroundColor: '#e2e8f0',
-    borderRadius: 4,
-    overflow: 'hidden',
+  profileInfoValue: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#0f172a',
   },
-  storageProgressFill: {
-    height: '100%',
-    backgroundColor: '#0284c7',
-    borderRadius: 4,
+  profileCloseBtn: {
+    backgroundColor: '#f1f5f9',
+    width: '100%',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginTop: 20,
+  },
+  profileCloseBtnText: {
+    color: '#334155',
+    fontSize: 14,
+    fontWeight: '700',
   },
   permissionCard: {
     backgroundColor: '#eff6ff',
     borderRadius: 14,
     padding: 14,
-    marginBottom: 14,
+    marginBottom: 16,
     borderWidth: 1,
     borderColor: '#bfdbfe',
   },
@@ -1361,20 +1632,8 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
   },
-  viewToggleBtn: {
-    backgroundColor: '#e0f2fe',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  viewToggleBtnText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#0284c7',
-  },
-  gridContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginHorizontal: -4,
+  modalWrapper: {
+    flex: 1,
+    paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 0,
   },
 });

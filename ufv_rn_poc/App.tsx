@@ -23,7 +23,6 @@ import {
   FolderFile,
   PickedFile,
 } from './src/services/ArchiveEngine';
-import { ViewersScreen } from './src/screens/ViewersScreen';
 import { RarViewerScreen } from './src/screens/RarViewerScreen';
 import { ZipViewerScreen } from './src/screens/ZipViewerScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
@@ -48,7 +47,7 @@ interface BenchmarkRecord {
 }
 
 export default function App(): React.JSX.Element {
-  const [activeTab, setActiveTab] = useState<'HOME' | 'BROWSE' | 'STARRED' | 'VIEWERS' | 'ARCHIVE'>('HOME');
+  const [activeTab, setActiveTab] = useState<'HOME' | 'BROWSE' | 'STARRED' | 'ARCHIVE'>('HOME');
   const [records, setRecords] = useState<BenchmarkRecord[]>([]);
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [activeFileName, setActiveFileName] = useState<string>('');
@@ -316,8 +315,6 @@ export default function App(): React.JSX.Element {
         setActiveTab('HOME');
       } else if (s.includes('BROWSE') || s.includes('FOLDER') || s.includes('FILE')) {
         setActiveTab('BROWSE');
-      } else if (s.includes('VIEWER') || s.includes('DETECT')) {
-        setActiveTab('VIEWERS');
       } else if (s.includes('ARCHIVE')) {
         setActiveTab('ARCHIVE');
       } else {
@@ -331,18 +328,20 @@ export default function App(): React.JSX.Element {
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
-      <View style={styles.header}>
-        <View style={styles.headerTitleRow}>
-          <View>
-            <Text style={styles.title}>Universal File Viewer</Text>
-            <Text style={styles.subtitle}>Fast, Offline Document & Media Reader</Text>
-          </View>
-          <View style={styles.offlinePill}>
-            <Text style={styles.offlinePillText}>🔒 100% Offline</Text>
+      <StatusBar barStyle="dark-content" backgroundColor="#f8fafc" />
+      {activeTab !== 'HOME' && (
+        <View style={styles.header}>
+          <View style={styles.headerTitleRow}>
+            <View>
+              <Text style={styles.title}>Universal File Viewer</Text>
+              <Text style={styles.subtitle}>Fast, Offline Document & Media Reader</Text>
+            </View>
+            <View style={styles.offlinePill}>
+              <Text style={styles.offlinePillText}>🔒 100% Offline</Text>
+            </View>
           </View>
         </View>
-      </View>
+      )}
 
       <View style={styles.body}>
         {activeTab === 'HOME' ? (
@@ -351,8 +350,6 @@ export default function App(): React.JSX.Element {
           <FolderBrowserScreen navigation={navigation} />
         ) : activeTab === 'STARRED' ? (
           <HomeScreen navigation={navigation} initialCategory="STARRED" />
-        ) : activeTab === 'VIEWERS' ? (
-          <ViewersScreen />
         ) : (
           <ScrollView contentContainerStyle={styles.content}>
         {/* Active Progress Card */}
@@ -563,14 +560,14 @@ export default function App(): React.JSX.Element {
         }}
       />
 
-      {/* Modern Bottom Navigation Bar */}
+      {/* Modern Bottom Navigation Bar (4 clean tabs) */}
       <View style={styles.bottomNav}>
         <TouchableOpacity
           style={styles.navItem}
           onPress={() => setActiveTab('HOME')}
           activeOpacity={0.7}>
           <View style={[styles.navIconBox, activeTab === 'HOME' && styles.navIconBoxActive]}>
-            <Text style={styles.navIcon}>🏠</Text>
+            <Text style={[styles.navIcon, activeTab === 'HOME' && styles.navIconActive]}>🏠</Text>
           </View>
           <Text style={[styles.navLabel, activeTab === 'HOME' && styles.navLabelActive]}>
             Home
@@ -582,7 +579,7 @@ export default function App(): React.JSX.Element {
           onPress={() => setActiveTab('BROWSE')}
           activeOpacity={0.7}>
           <View style={[styles.navIconBox, activeTab === 'BROWSE' && styles.navIconBoxActive]}>
-            <Text style={styles.navIcon}>📂</Text>
+            <Text style={[styles.navIcon, activeTab === 'BROWSE' && styles.navIconActive]}>📁</Text>
           </View>
           <Text style={[styles.navLabel, activeTab === 'BROWSE' && styles.navLabelActive]}>
             Files
@@ -594,7 +591,7 @@ export default function App(): React.JSX.Element {
           onPress={() => setActiveTab('STARRED')}
           activeOpacity={0.7}>
           <View style={[styles.navIconBox, activeTab === 'STARRED' && styles.navIconBoxActiveStar]}>
-            <Text style={styles.navIcon}>⭐</Text>
+            <Text style={[styles.navIcon, activeTab === 'STARRED' && styles.navIconActive]}>⭐</Text>
           </View>
           <Text style={[styles.navLabel, activeTab === 'STARRED' && styles.navLabelActiveStar]}>
             Starred
@@ -603,22 +600,10 @@ export default function App(): React.JSX.Element {
 
         <TouchableOpacity
           style={styles.navItem}
-          onPress={() => setActiveTab('VIEWERS')}
-          activeOpacity={0.7}>
-          <View style={[styles.navIconBox, activeTab === 'VIEWERS' && styles.navIconBoxActive]}>
-            <Text style={styles.navIcon}>🔍</Text>
-          </View>
-          <Text style={[styles.navLabel, activeTab === 'VIEWERS' && styles.navLabelActive]}>
-            Detect
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={styles.navItem}
           onPress={() => setActiveTab('ARCHIVE')}
           activeOpacity={0.7}>
           <View style={[styles.navIconBox, activeTab === 'ARCHIVE' && styles.navIconBoxActive]}>
-            <Text style={styles.navIcon}>🗜️</Text>
+            <Text style={[styles.navIcon, activeTab === 'ARCHIVE' && styles.navIconActive]}>📦</Text>
           </View>
           <Text style={[styles.navLabel, activeTab === 'ARCHIVE' && styles.navLabelActive]}>
             Archive
@@ -802,15 +787,15 @@ const styles = StyleSheet.create({
   },
   bottomNav: {
     flexDirection: 'row',
-    height: 64,
+    height: 62,
     backgroundColor: '#ffffff',
     borderTopWidth: 1,
-    borderTopColor: '#e2e8f0',
+    borderTopColor: '#f1f5f9',
     alignItems: 'center',
     justifyContent: 'space-around',
     elevation: 8,
     shadowColor: '#000',
-    shadowOpacity: 0.08,
+    shadowOpacity: 0.05,
     shadowRadius: 4,
     shadowOffset: { width: 0, height: -2 },
   },
@@ -821,27 +806,31 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   navIconBox: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
     paddingVertical: 3,
-    borderRadius: 16,
+    borderRadius: 14,
   },
   navIconBoxActive: {
-    backgroundColor: '#e0f2fe',
+    backgroundColor: '#eff6ff',
   },
   navIconBoxActiveStar: {
     backgroundColor: '#fef3c7',
   },
   navIcon: {
     fontSize: 20,
+    opacity: 0.7,
+  },
+  navIconActive: {
+    opacity: 1,
   },
   navLabel: {
-    fontSize: 10,
-    fontWeight: '600',
+    fontSize: 11,
+    fontWeight: '500',
     color: '#64748b',
     marginTop: 2,
   },
   navLabelActive: {
-    color: '#0284c7',
+    color: '#2563eb',
     fontWeight: '700',
   },
   navLabelActiveStar: {
