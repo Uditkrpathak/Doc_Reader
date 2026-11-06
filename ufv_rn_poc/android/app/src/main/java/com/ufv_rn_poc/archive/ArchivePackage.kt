@@ -15,6 +15,8 @@ class ArchivePackage : ReactPackage {
         )
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
-        emptyList()
+        listOf(
+            com.ufv_rn_poc.video.VideoCardViewManager()
+        )
 }
 

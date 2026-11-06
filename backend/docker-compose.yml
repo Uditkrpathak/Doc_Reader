@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docreader-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=postgresql://docreader:secure_pass_123@postgres:5432/docreader?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=change-this-production-jwt-secret-key-32-chars-min
+      - ADMIN_JWT_SECRET=change-this-production-admin-jwt-secret-32-chars
+      - OFFLINE_TOKEN_PRIVATE_KEY=""
+      - OFFLINE_TOKEN_PUBLIC_KEY=""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: docreader-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docreader
+      POSTGRES_PASSWORD: secure_pass_123
+      POSTGRES_DB: docreader
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docreader -d docreader"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: docreader-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+

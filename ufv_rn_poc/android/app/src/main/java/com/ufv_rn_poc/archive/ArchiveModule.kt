@@ -8,7 +8,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.*
 import android.os.Environment
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.content.ClipData
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.graphics.Bitmap
@@ -18,8 +20,10 @@ import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import android.media.MediaPlayer
+import android.webkit.MimeTypeMap
 import java.nio.charset.Charset
 import java.util.Locale
+import java.util.ArrayList
 
 class ArchiveModule(private val reactContext: ReactApplicationContext) : 
     ReactContextBaseJavaModule(reactContext), 
@@ -83,11 +87,198 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    data class CachedFileInfo(
+        val file: File,
+        val name: String,
+        val size: Long,
+        val mimeType: String
+    )
+
     companion object {
         private var instance: ArchiveModule? = null
 
+        fun cacheIncomingUri(context: Context, uri: Uri, intentMimeType: String?): CachedFileInfo? {
+            try {
+                val scheme = uri.scheme
+                val resolver = context.contentResolver
+
+                // 1. If it's already a direct local file
+                if (scheme == "file" || scheme.isNullOrBlank()) {
+                    val rawPath = uri.path ?: uri.toString().removePrefix("file://")
+                    val f = File(rawPath)
+                    if (f.exists() && f.isFile) {
+                        val mime = if (!intentMimeType.isNullOrBlank()) intentMimeType else "*/*"
+                        return CachedFileInfo(f, f.name, f.length(), mime)
+                    }
+                }
+
+                // 2. Query MIME type from provider or intent
+                var resolvedMime = try {
+                    if (scheme == "content") resolver.getType(uri) ?: intentMimeType ?: "" else intentMimeType ?: ""
+                } catch (_: Exception) {
+                    intentMimeType ?: ""
+                }
+
+                // 3. Query display name
+                var displayName: String? = null
+                if (scheme == "content") {
+                    try {
+                        resolver.query(uri, null, null, null, null)?.use { cursor ->
+                            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (nameIdx >= 0 && cursor.moveToFirst()) {
+                                displayName = cursor.getString(nameIdx)
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                if (displayName.isNullOrBlank()) {
+                    val path = uri.path
+                    val cut = path?.lastIndexOf('/')
+                    if (cut != null && cut != -1) {
+                        displayName = path.substring(cut + 1)
+                    }
+                }
+
+                if (displayName.isNullOrBlank()) {
+                    displayName = "document_${System.currentTimeMillis()}"
+                }
+
+                var cleanName = displayName!!.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+
+                // Ensure valid extension
+                val currentExt = cleanName.substringAfterLast('.', "")
+                val hasValidExt = currentExt.isNotBlank() && currentExt.length in 2..5 && !currentExt.contains(" ")
+
+                if (!hasValidExt) {
+                    val extFromMime = if (resolvedMime.isNotBlank()) {
+                        MimeTypeMap.getSingleton().getExtensionFromMimeType(resolvedMime)
+                    } else null
+
+                    val extToAppend = when {
+                        !extFromMime.isNullOrBlank() -> extFromMime
+                        resolvedMime.contains("pdf") -> "pdf"
+                        resolvedMime.contains("word") || resolvedMime.contains("document") -> "docx"
+                        resolvedMime.contains("sheet") || resolvedMime.contains("excel") -> "xlsx"
+                        resolvedMime.contains("presentation") || resolvedMime.contains("powerpoint") -> "pptx"
+                        resolvedMime.contains("csv") -> "csv"
+                        resolvedMime.contains("plain") || resolvedMime.contains("text") -> "txt"
+                        resolvedMime.contains("zip") -> "zip"
+                        resolvedMime.contains("rar") -> "rar"
+                        resolvedMime.contains("jpeg") || resolvedMime.contains("jpg") -> "jpg"
+                        resolvedMime.contains("png") -> "png"
+                        resolvedMime.contains("audio") -> "mp3"
+                        resolvedMime.contains("video") -> "mp4"
+                        else -> ""
+                    }
+
+                    if (extToAppend.isNotBlank()) {
+                        cleanName = "$cleanName.$extToAppend"
+                    }
+                }
+
+                val incomingDir = File(context.cacheDir, "incoming")
+                if (!incomingDir.exists()) incomingDir.mkdirs()
+
+                val safeUniqueName = "shared_${System.currentTimeMillis()}_$cleanName"
+                val destFile = File(incomingDir, safeUniqueName)
+
+                // Copy stream
+                val inputStream = resolver.openInputStream(uri) ?: return null
+                inputStream.use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var read: Int
+                        var total = 0L
+                        val maxCap = 500L * 1024L * 1024L // 500MB safety cap
+                        while (input.read(buffer).also { read = it } != -1) {
+                            total += read
+                            if (total > maxCap) {
+                                output.close()
+                                destFile.delete()
+                                return null
+                            }
+                            output.write(buffer, 0, read)
+                        }
+                    }
+                }
+
+                if (!destFile.exists() || destFile.length() == 0L) {
+                    return null
+                }
+
+                // Check magic bytes if extension or mimeType was generic
+                if (!cleanName.contains(".") || resolvedMime.isBlank() || resolvedMime == "application/octet-stream") {
+                    try {
+                        val header = ByteArray(16)
+                        FileInputStream(destFile).use { it.read(header) }
+                        if (header.size >= 4) {
+                            if (header[0] == 0x25.toByte() && header[1] == 0x50.toByte() && header[2] == 0x44.toByte() && header[3] == 0x46.toByte()) {
+                                resolvedMime = "application/pdf"
+                                if (!cleanName.endsWith(".pdf", ignoreCase = true)) {
+                                    val renamed = File(incomingDir, "$safeUniqueName.pdf")
+                                    if (destFile.renameTo(renamed)) {
+                                        return CachedFileInfo(renamed, "$cleanName.pdf", renamed.length(), resolvedMime)
+                                    }
+                                }
+                            } else if (header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() && header[2] == 0x03.toByte() && header[3] == 0x04.toByte()) {
+                                if (resolvedMime.isBlank() || resolvedMime == "application/octet-stream") {
+                                    resolvedMime = "application/zip"
+                                }
+                            } else if (header[0] == 0x52.toByte() && header[1] == 0x61.toByte() && header[2] == 0x72.toByte() && header[3] == 0x21.toByte()) {
+                                resolvedMime = "application/x-rar-compressed"
+                                if (!cleanName.endsWith(".rar", ignoreCase = true)) {
+                                    val renamed = File(incomingDir, "$safeUniqueName.rar")
+                                    if (destFile.renameTo(renamed)) {
+                                        return CachedFileInfo(renamed, "$cleanName.rar", renamed.length(), resolvedMime)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                return CachedFileInfo(
+                    file = destFile,
+                    name = cleanName,
+                    size = destFile.length(),
+                    mimeType = if (resolvedMime.isNotBlank()) resolvedMime else "*/*"
+                )
+            } catch (e: Exception) {
+                android.util.Log.e("ArchiveModule", "cacheIncomingUri error: ${e.message}", e)
+                return null
+            }
+        }
+
+        fun sendSharedFileEvent(context: ReactContext?, params: WritableMap) {
+            try {
+                if (context != null && context.hasActiveReactInstance()) {
+                    context
+                        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                        .emit("onSharedFile", params)
+                }
+            } catch (_: Exception) {}
+        }
+
         fun handleIncomingIntent(context: ReactContext?, intent: Intent) {
-            instance?.processIncomingIntent(intent)
+            try {
+                val uri = com.ufv_rn_poc.MainActivity.extractUriFromIntent(intent) ?: return
+                val ctx = context ?: instance?.reactContext ?: return
+                val cached = cacheIncomingUri(ctx, uri, intent.type)
+                if (cached != null) {
+                    val map = Arguments.createMap().apply {
+                        putString("uri", "file://${cached.file.absolutePath}")
+                        putString("path", cached.file.absolutePath)
+                        putString("name", cached.name)
+                        putDouble("size", cached.size.toDouble())
+                        putString("mimeType", cached.mimeType)
+                        putString("action", intent.action)
+                    }
+                    sendSharedFileEvent(context, map)
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("ArchiveModule", "handleIncomingIntent error: ${e.message}")
+            }
         }
 
         fun stopActivePlayback() {
@@ -115,14 +306,17 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
     private fun getFileName(uri: Uri): String? {
         var name: String? = null
         if (uri.scheme == "content") {
-            reactContext.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (index != -1) {
-                        name = cursor.getString(index)
+            val resolver = (currentActivity ?: reactContext).contentResolver
+            try {
+                resolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (index != -1) {
+                            name = cursor.getString(index)
+                        }
                     }
                 }
-            }
+            } catch (_: Exception) {}
         }
         if (name == null) {
             name = uri.path
@@ -154,8 +348,9 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
             try {
                 val uri = Uri.parse(filePath)
                 var displayName = "shared_file_${System.currentTimeMillis()}"
+                val resolver = (currentActivity ?: reactContext).contentResolver
                 try {
-                    reactContext.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    resolver.query(uri, null, null, null, null)?.use { cursor ->
                         val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                         if (nameIdx >= 0 && cursor.moveToFirst()) {
                             val name = cursor.getString(nameIdx)
@@ -175,7 +370,7 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                     return targetFile
                 }
 
-                reactContext.contentResolver.openInputStream(uri)?.use { input ->
+                resolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(targetFile).use { output ->
                         input.copyTo(output)
                     }
@@ -251,6 +446,7 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                     map.putString("name", f.name)
                     map.putString("path", f.absolutePath)
                     map.putDouble("size", if (f.isDirectory) 0.0 else f.length().toDouble())
+                    map.putDouble("lastModified", f.lastModified().toDouble())
                     val ext = if (f.isDirectory) "" else f.extension.lowercase()
                     val isArchive = ext == "zip" || ext == "rar" || ext == "7z" || ext == "tar" || ext == "gz"
                     map.putBoolean("isArchive", isArchive)
@@ -852,6 +1048,7 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                 map.putString("name", file.name)
                 map.putString("path", file.absolutePath)
                 map.putDouble("size", file.length().toDouble())
+                map.putDouble("lastModified", file.lastModified().toDouble())
                 map.putInt("bytesRead", bytesRead)
                 map.putString("hexString", hexString.toString().trim())
                 map.putArray("hexBytes", hexArray)
@@ -970,6 +1167,27 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
             val startTime = System.currentTimeMillis()
             try {
                 val file = resolveArchiveFile(filePath)
+                val cacheDir = File(reactContext.cacheDir, "pdf_cache")
+                if (!cacheDir.exists()) cacheDir.mkdirs()
+
+                // Fast disk cache check
+                val safePathHash = Math.abs(file.absolutePath.hashCode())
+                val cacheKey = "pdf_p_${safePathHash}_${file.lastModified()}_${pageIndex}_w${targetWidth}.jpg"
+                val cachedOutFile = File(cacheDir, cacheKey)
+                if (cachedOutFile.exists() && cachedOutFile.length() > 0) {
+                    val map = Arguments.createMap()
+                    map.putString("status", "SUCCESS")
+                    map.putString("imagePath", "file://${cachedOutFile.absolutePath}")
+                    map.putInt("pageIndex", pageIndex)
+                    map.putInt("pageCount", 0)
+                    map.putInt("width", if (targetWidth > 0) targetWidth else 1000)
+                    map.putInt("height", 0)
+                    map.putDouble("renderLatencyMs", (System.currentTimeMillis() - startTime).toDouble())
+                    map.putBoolean("fromCache", true)
+                    promise.resolve(map)
+                    return@launch
+                }
+
                 pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
                 renderer = PdfRenderer(pfd)
 
@@ -990,21 +1208,21 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                 canvas.drawColor(Color.WHITE)
                 page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
-                val outFile = File(reactContext.cacheDir, "pdf_render_${System.currentTimeMillis()}_p${pageIndex}.png")
-                FileOutputStream(outFile).use { fos ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 90, fos)
+                FileOutputStream(cachedOutFile).use { fos ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
                 }
                 bitmap.recycle()
 
                 val elapsed = System.currentTimeMillis() - startTime
                 val map = Arguments.createMap()
                 map.putString("status", "SUCCESS")
-                map.putString("imagePath", "file://${outFile.absolutePath}")
+                map.putString("imagePath", "file://${cachedOutFile.absolutePath}")
                 map.putInt("pageIndex", pageIndex)
                 map.putInt("pageCount", renderer.pageCount)
                 map.putInt("width", bmpW)
                 map.putInt("height", bmpH)
                 map.putDouble("renderLatencyMs", elapsed.toDouble())
+                map.putBoolean("fromCache", false)
                 promise.resolve(map)
             } catch (e: Exception) {
                 promise.reject("RENDER_ERROR", "Failed to render PDF page $pageIndex: ${e.message}", e)
@@ -1012,6 +1230,577 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                 page?.close()
                 renderer?.close()
                 pfd?.close()
+            }
+        }
+    }
+
+    @ReactMethod
+    fun searchPdfText(filePath: String, query: String, promise: Promise) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val file = resolveArchiveFile(filePath)
+                if (!file.exists()) {
+                    promise.reject("FILE_NOT_FOUND", "PDF file not found: $filePath")
+                    return@launch
+                }
+
+                val trimmedQuery = query.trim()
+                if (trimmedQuery.isEmpty()) {
+                    val map = Arguments.createMap()
+                    map.putString("query", "")
+                    map.putInt("totalMatches", 0)
+                    map.putArray("matchingPages", Arguments.createArray())
+                    map.putArray("pageMatchCounts", Arguments.createArray())
+                    map.putArray("matches", Arguments.createArray())
+                    promise.resolve(map)
+                    return@launch
+                }
+
+                val bytes = file.readBytes()
+                val str = String(bytes, Charset.forName("ISO-8859-1"))
+
+                // Helper to unescape PDF literal strings
+                fun unescapePdfLiteral(raw: String): ByteArray {
+                    val out = ArrayList<Byte>()
+                    var i = 0
+                    val len = raw.length
+                    while (i < len) {
+                        if (raw[i] == '\\') {
+                            i++
+                            if (i >= len) break
+                            val c = raw[i]
+                            when (c) {
+                                'n' -> { out.add(0x0a.toByte()); i++ }
+                                'r' -> { out.add(0x0d.toByte()); i++ }
+                                't' -> { out.add(0x09.toByte()); i++ }
+                                'b' -> { out.add(0x08.toByte()); i++ }
+                                'f' -> { out.add(0x0c.toByte()); i++ }
+                                '(' -> { out.add('('.code.toByte()); i++ }
+                                ')' -> { out.add(')'.code.toByte()); i++ }
+                                '\\' -> { out.add('\\'.code.toByte()); i++ }
+                                in '0'..'7' -> {
+                                    var oct = "" + c
+                                    i++
+                                    if (i < len && raw[i] in '0'..'7') {
+                                        oct += raw[i]
+                                        i++
+                                        if (i < len && raw[i] in '0'..'7') {
+                                            oct += raw[i]
+                                            i++
+                                        }
+                                    }
+                                    try {
+                                        out.add(oct.toInt(8).toByte())
+                                    } catch (_: Exception) {}
+                                }
+                                '\r', '\n' -> {
+                                    if (c == '\r' && i + 1 < len && raw[i + 1] == '\n') i++
+                                    i++
+                                }
+                                else -> {
+                                    out.add(c.code.toByte())
+                                    i++
+                                }
+                            }
+                        } else {
+                            out.add(raw[i].code.toByte())
+                            i++
+                        }
+                    }
+                    val res = ByteArray(out.size)
+                    for (k in out.indices) res[k] = out[k]
+                    return res
+                }
+
+                // 1. Build CMap from all begincmap streams
+                val cmapMap = mutableMapOf<Int, Char>()
+                var pos = 0
+                while (true) {
+                    val sIdx = str.indexOf("stream", pos)
+                    if (sIdx == -1) break
+                    var start = sIdx + 6
+                    if (start < bytes.size && bytes[start] == '\r'.code.toByte()) start++
+                    if (start < bytes.size && bytes[start] == '\n'.code.toByte()) start++
+
+                    val eIdx = str.indexOf("endstream", start)
+                    if (eIdx == -1) break
+                    var end = eIdx
+                    if (end > start && bytes[end - 1] == '\n'.code.toByte()) end--
+                    if (end > start && bytes[end - 1] == '\r'.code.toByte()) end--
+
+                    if (end > start && start < bytes.size) {
+                        try {
+                            val rawStream = bytes.copyOfRange(start, end.coerceAtMost(bytes.size))
+                            var decompressed: ByteArray? = null
+                            try {
+                                val inf = Inflater()
+                                inf.setInput(rawStream)
+                                val bos = ByteArrayOutputStream()
+                                val buf = ByteArray(4096)
+                                while (!inf.finished()) {
+                                    val count = inf.inflate(buf)
+                                    if (count <= 0 && inf.needsInput()) break
+                                    bos.write(buf, 0, count)
+                                }
+                                inf.end()
+                                decompressed = bos.toByteArray()
+                            } catch (_: Exception) {
+                                try {
+                                    val inf = Inflater(true)
+                                    inf.setInput(rawStream)
+                                    val bos = ByteArrayOutputStream()
+                                    val buf = ByteArray(4096)
+                                    while (!inf.finished()) {
+                                        val count = inf.inflate(buf)
+                                        if (count <= 0 && inf.needsInput()) break
+                                        bos.write(buf, 0, count)
+                                    }
+                                    inf.end()
+                                    decompressed = bos.toByteArray()
+                                } catch (_: Exception) {}
+                            }
+
+                            if (decompressed != null) {
+                                val cStr = String(decompressed, Charset.forName("UTF-8"))
+                                if (cStr.contains("begincmap")) {
+                                    val bfcharRegex = Regex("""beginbfchar([\s\S]*?)endbfchar""")
+                                    for (m in bfcharRegex.findAll(cStr)) {
+                                        val lines = m.groupValues[1].lines()
+                                        for (line in lines) {
+                                            val parts = Regex("""<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>""").find(line)
+                                            if (parts != null) {
+                                                val cid = parts.groupValues[1].toIntOrNull(16)
+                                                val uni = parts.groupValues[2].toIntOrNull(16)
+                                                if (cid != null && uni != null) {
+                                                    cmapMap[cid] = uni.toChar()
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    val bfrangeRegex = Regex("""beginbfrange([\s\S]*?)endbfrange""")
+                                    for (m in bfrangeRegex.findAll(cStr)) {
+                                        val lines = m.groupValues[1].lines()
+                                        for (line in lines) {
+                                            val parts = Regex("""<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>""").find(line)
+                                            if (parts != null) {
+                                                val startCid = parts.groupValues[1].toIntOrNull(16)
+                                                val endCid = parts.groupValues[2].toIntOrNull(16)
+                                                val destUni = parts.groupValues[3].toIntOrNull(16)
+                                                if (startCid != null && endCid != null && destUni != null) {
+                                                    for (c in startCid..endCid) {
+                                                        cmapMap[c] = (destUni + (c - startCid)).toChar()
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    pos = eIdx + 9
+                }
+
+                // Helper to decode extracted bytes (using CMap or fallback)
+                fun decodeBytes(rawBytes: ByteArray): String {
+                    if (rawBytes.isEmpty()) return ""
+                    var isCid = false
+                    var i = 0
+                    while (i < rawBytes.size) {
+                        if (i + 1 < rawBytes.size) {
+                            val b1 = rawBytes[i].toInt() and 0xFF
+                            val b2 = rawBytes[i + 1].toInt() and 0xFF
+                            val cid = (b1 shl 8) or b2
+                            if (cmapMap.containsKey(cid)) {
+                                isCid = true
+                                break
+                            }
+                        }
+                        i += 2
+                    }
+
+                    val sb = StringBuilder()
+                    if (isCid) {
+                        i = 0
+                        while (i < rawBytes.size) {
+                            if (i + 1 < rawBytes.size) {
+                                val b1 = rawBytes[i].toInt() and 0xFF
+                                val b2 = rawBytes[i + 1].toInt() and 0xFF
+                                val cid = (b1 shl 8) or b2
+                                val ch = cmapMap[cid]
+                                if (ch != null) {
+                                    sb.append(ch)
+                                } else {
+                                    sb.append(b1.toChar()).append(b2.toChar())
+                                }
+                            } else {
+                                sb.append((rawBytes[i].toInt() and 0xFF).toChar())
+                            }
+                            i += 2
+                        }
+                    } else {
+                        sb.append(String(rawBytes, Charset.forName("ISO-8859-1")))
+                    }
+                    return sb.toString()
+                }
+
+                fun extractAllTextFromStream(streamStr: String): String {
+                    val sb = StringBuilder()
+                    val tjRegex = Regex("""\(((?:[^()\\]|\\.)*)\)\s*(?:Tj|'|")""")
+                    for (m in tjRegex.findAll(streamStr)) {
+                        val unescaped = unescapePdfLiteral(m.groupValues[1])
+                        sb.append(decodeBytes(unescaped))
+                    }
+                    val tjArrayRegex = Regex("""\[([^\]]+)\]\s*TJ""")
+                    for (m in tjArrayRegex.findAll(streamStr)) {
+                        val inner = m.groupValues[1]
+                        val innerRegex = Regex("""\(((?:[^()\\]|\\.)*)\)""")
+                        for (im in innerRegex.findAll(inner)) {
+                            val unescaped = unescapePdfLiteral(im.groupValues[1])
+                            sb.append(decodeBytes(unescaped))
+                        }
+                        sb.append(" ")
+                    }
+                    return sb.toString()
+                }
+
+                // 2. Parse all objects and decompress streams
+                val objMap = mutableMapOf<Int, String>()
+                val streamMap = mutableMapOf<Int, String>()
+                val objHeaderRegex = Regex("""(\d+)\s+0\s+obj""")
+                val objMatches = objHeaderRegex.findAll(str).toList()
+                for (idx in objMatches.indices) {
+                    val curMatch = objMatches[idx]
+                    val id = curMatch.groupValues[1].toIntOrNull() ?: continue
+                    val startPos = curMatch.range.first
+                    val nextPos = if (idx + 1 < objMatches.size) objMatches[idx + 1].range.first else str.length
+                    val body = str.substring(startPos, nextPos)
+                    objMap[id] = body
+
+                    val sIdx = body.indexOf("stream")
+                    if (sIdx != -1) {
+                        var streamStart = startPos + sIdx + 6
+                        if (streamStart < bytes.size && bytes[streamStart] == '\r'.code.toByte()) streamStart++
+                        if (streamStart < bytes.size && bytes[streamStart] == '\n'.code.toByte()) streamStart++
+                        val endstreamIdx = str.indexOf("endstream", streamStart)
+                        if (endstreamIdx != -1) {
+                            var streamEnd = endstreamIdx
+                            if (streamEnd > streamStart && bytes[streamEnd - 1] == '\n'.code.toByte()) streamEnd--
+                            if (streamEnd > streamStart && bytes[streamEnd - 1] == '\r'.code.toByte()) streamEnd--
+
+                            if (streamEnd > streamStart && streamStart < bytes.size) {
+                                val rawStream = bytes.copyOfRange(streamStart, streamEnd.coerceAtMost(bytes.size))
+                                var decompressed: ByteArray? = null
+                                try {
+                                    val inf = Inflater()
+                                    inf.setInput(rawStream)
+                                    val bos = ByteArrayOutputStream()
+                                    val buf = ByteArray(4096)
+                                    while (!inf.finished()) {
+                                        val count = inf.inflate(buf)
+                                        if (count <= 0 && inf.needsInput()) break
+                                        bos.write(buf, 0, count)
+                                    }
+                                    inf.end()
+                                    decompressed = bos.toByteArray()
+                                } catch (_: Exception) {
+                                    try {
+                                        val inf = Inflater(true)
+                                        inf.setInput(rawStream)
+                                        val bos = ByteArrayOutputStream()
+                                        val buf = ByteArray(4096)
+                                        while (!inf.finished()) {
+                                            val count = inf.inflate(buf)
+                                            if (count <= 0 && inf.needsInput()) break
+                                            bos.write(buf, 0, count)
+                                        }
+                                        inf.end()
+                                        decompressed = bos.toByteArray()
+                                    } catch (_: Exception) {}
+                                }
+                                val finalBytes = decompressed ?: rawStream
+                                streamMap[id] = String(finalBytes, Charset.forName("ISO-8859-1"))
+                            }
+                        }
+                    }
+                }
+
+                // 3. Find Page IDs from /Type /Pages /Kids or scan /Type /Page
+                val pageIds = mutableListOf<Int>()
+                val kidsMatch = Regex("""/Type\s*/Pages[\s\S]*?/Kids\s*\[([^\]]+)\]""").find(str)
+                if (kidsMatch != null) {
+                    val kidRefs = Regex("""(\d+)\s+0\s+R""").findAll(kidsMatch.groupValues[1])
+                    for (kr in kidRefs) {
+                        val pid = kr.groupValues[1].toIntOrNull()
+                        if (pid != null) pageIds.add(pid)
+                    }
+                }
+                if (pageIds.isEmpty()) {
+                    val pageRegex = Regex("""(\d+)\s+0\s+obj[\s\S]*?/Type\s*/Page\b""")
+                    for (pm in pageRegex.findAll(str)) {
+                        val pid = pm.groupValues[1].toIntOrNull()
+                        if (pid != null && !pageIds.contains(pid)) pageIds.add(pid)
+                    }
+                }
+
+                // 4. Extract text & streams per page
+                val pageTexts = mutableListOf<String>()
+                val pageStreamsList = mutableListOf<List<Pair<String, Boolean>>>()
+
+                for (pId in pageIds) {
+                    val pageBody = objMap[pId] ?: ""
+                    val pageSb = StringBuilder()
+                    val pageStreams = mutableListOf<Pair<String, Boolean>>()
+
+                    // /Contents
+                    val contentsMatch = Regex("""/Contents\s+(?:(\d+)\s+0\s+R|\[([^\]]+)\])""").find(pageBody)
+                    if (contentsMatch != null) {
+                        val singleId = contentsMatch.groupValues[1].toIntOrNull()
+                        val refIds = if (singleId != null) {
+                            listOf(singleId)
+                        } else {
+                            Regex("""(\d+)\s+0\s+R""").findAll(contentsMatch.groupValues[2]).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
+                        }
+                        for (rId in refIds) {
+                            val st = streamMap[rId]
+                            if (st != null) {
+                                pageSb.append(extractAllTextFromStream(st)).append(" ")
+                                pageStreams.add(Pair(st, false))
+                            }
+                        }
+                    }
+
+                    // Form XObjects in /Resources /XObject
+                    val xobjSection = Regex("""/XObject\s*<<([\s\S]*?)>>""").find(pageBody)
+                    if (xobjSection != null) {
+                        val xRefs = Regex("""(\d+)\s+0\s+R""").findAll(xobjSection.groupValues[1]).mapNotNull { it.groupValues[1].toIntOrNull() }
+                        for (xId in xRefs) {
+                            val st = streamMap[xId]
+                            if (st != null) {
+                                pageSb.append(extractAllTextFromStream(st)).append(" ")
+                                pageStreams.add(Pair(st, true))
+                            }
+                        }
+                    }
+
+                    pageTexts.add(pageSb.toString())
+                    pageStreamsList.add(pageStreams)
+                }
+
+                // Fallback if no pages identified: search all streams
+                if (pageTexts.isEmpty()) {
+                    for ((_, st) in streamMap) {
+                        pageTexts.add(extractAllTextFromStream(st))
+                        pageStreamsList.add(listOf(Pair(st, false)))
+                    }
+                }
+
+                // Helper to compute exact on-page highlight rectangles
+                class MatchBox(val x: Double, val y: Double, val width: Double, val height: Double)
+
+                fun findMatchBoxes(streamRaw: String, q: String, pageW: Double, pageH: Double, isXObject: Boolean): List<MatchBox> {
+                    val boxes = mutableListOf<MatchBox>()
+                    val lines = streamRaw.split(Regex("""[\r\n]+"""))
+                    var curCm = doubleArrayOf(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                    var curTfSize = 12.0
+                    var curTextX = 0.0
+                    var curTextY = 0.0
+                    val currentWord = StringBuilder()
+                    var wordStartX = 0.0
+                    var wordStartY = 0.0
+                    var wordCm = curCm.clone()
+                    var wordTf = 12.0
+
+                    val lowerQ = q.lowercase(Locale.ROOT)
+                    val globalCm = if (isXObject) doubleArrayOf(0.24, 0.0, 0.0, -0.24, 0.0, pageH) else doubleArrayOf(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+                    val cmRegex = Regex("""^([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+cm$""")
+                    val tfRegex = Regex("""/F\d+\s+([0-9.]+)\s+Tf""")
+                    val tmRegex = Regex("""^([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+([0-9.-]+)\s+Tm$""")
+                    val tdRegex = Regex("""^([0-9.-]+)\s+([0-9.-]+)\s+Td$""")
+                    val tjRegex = Regex("""^\(([\s\S]*)\)\s*Tj$""")
+
+                    for (lineRaw in lines) {
+                        val line = lineRaw.trim()
+                        if (line.isEmpty()) continue
+
+                        val cmM = cmRegex.find(line)
+                        if (cmM != null) {
+                            curCm = doubleArrayOf(
+                                cmM.groupValues[1].toDoubleOrNull() ?: 1.0,
+                                cmM.groupValues[2].toDoubleOrNull() ?: 0.0,
+                                cmM.groupValues[3].toDoubleOrNull() ?: 0.0,
+                                cmM.groupValues[4].toDoubleOrNull() ?: 1.0,
+                                cmM.groupValues[5].toDoubleOrNull() ?: 0.0,
+                                cmM.groupValues[6].toDoubleOrNull() ?: 0.0
+                            )
+                            continue
+                        }
+
+                        val tfM = tfRegex.find(line)
+                        if (tfM != null) {
+                            curTfSize = tfM.groupValues[1].toDoubleOrNull() ?: 12.0
+                            continue
+                        }
+
+                        if (line == "BT") {
+                            curTextX = 0.0
+                            curTextY = 0.0
+                            continue
+                        }
+
+                        val tmM = tmRegex.find(line)
+                        if (tmM != null) {
+                            curTextX = tmM.groupValues[5].toDoubleOrNull() ?: 0.0
+                            curTextY = tmM.groupValues[6].toDoubleOrNull() ?: 0.0
+                            continue
+                        }
+
+                        val tdM = tdRegex.find(line)
+                        if (tdM != null) {
+                            curTextX += tdM.groupValues[1].toDoubleOrNull() ?: 0.0
+                            curTextY += tdM.groupValues[2].toDoubleOrNull() ?: 0.0
+                            continue
+                        }
+
+                        val tjM = tjRegex.find(line)
+                        if (tjM != null) {
+                            val unescaped = unescapePdfLiteral(tjM.groupValues[1])
+                            val decodedStr = decodeBytes(unescaped)
+
+                            for (ch in decodedStr) {
+                                if (currentWord.isEmpty()) {
+                                    if (ch.lowercaseChar() == lowerQ[0]) {
+                                        currentWord.append(ch)
+                                        wordStartX = curTextX
+                                        wordStartY = curTextY
+                                        wordCm = curCm.clone()
+                                        wordTf = curTfSize
+                                    }
+                                } else {
+                                    currentWord.append(ch)
+                                    if (currentWord.toString().lowercase(Locale.ROOT) == lowerQ) {
+                                        val xForm = wordCm[0] * wordStartX + wordCm[2] * wordStartY + wordCm[4]
+                                        val yForm = wordCm[1] * wordStartX + wordCm[3] * wordStartY + wordCm[5]
+
+                                        val xPage: Double
+                                        val yPage: Double
+                                        val wPage: Double
+                                        val hPage: Double
+
+                                        if (isXObject) {
+                                            xPage = globalCm[0] * xForm + globalCm[2] * yForm + globalCm[4]
+                                            yPage = globalCm[1] * xForm + globalCm[3] * yForm + globalCm[5]
+                                            wPage = Math.abs(globalCm[0] * wordCm[0]) * (wordTf * q.length * 0.55)
+                                            hPage = Math.abs(globalCm[3] * wordCm[3]) * wordTf
+                                        } else {
+                                            xPage = xForm
+                                            yPage = pageH - yForm
+                                            wPage = wordTf * q.length * 0.55
+                                            hPage = wordTf
+                                        }
+
+                                        val xPct = (xPage / pageW) * 100.0
+                                        val yPct = (1.0 - (yPage / pageH)) * 100.0
+                                        val wPct = (wPage / pageW) * 100.0
+                                        val hPct = (hPage / pageH) * 100.0
+
+                                        boxes.add(MatchBox(
+                                            Math.max(2.0, Math.min(95.0, Math.round(xPct * 10.0) / 10.0)),
+                                            Math.max(2.0, Math.min(95.0, Math.round(yPct * 10.0) / 10.0)),
+                                            Math.max(4.0, Math.min(80.0, Math.round(wPct * 10.0) / 10.0)),
+                                            Math.max(1.2, Math.min(10.0, Math.round(hPct * 10.0) / 10.0))
+                                        ))
+                                        currentWord.clear()
+                                    } else if (!lowerQ.startsWith(currentWord.toString().lowercase(Locale.ROOT))) {
+                                        currentWord.clear()
+                                        if (ch.lowercaseChar() == lowerQ[0]) {
+                                            currentWord.append(ch)
+                                            wordStartX = curTextX
+                                            wordStartY = curTextY
+                                            wordCm = curCm.clone()
+                                            wordTf = curTfSize
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return boxes
+                }
+
+                // 5. Search query in page texts & compute bounding boxes
+                var totalMatches = 0
+                val matchingPagesArr = Arguments.createArray()
+                val pageMatchCountsArr = Arguments.createArray()
+                val matchesArr = Arguments.createArray()
+
+                val lowerQuery = trimmedQuery.lowercase(Locale.ROOT)
+                for (pIdx in pageTexts.indices) {
+                    val pText = pageTexts[pIdx]
+                    val lowerPText = pText.lowercase(Locale.ROOT)
+                    val pStreams = if (pIdx < pageStreamsList.size) pageStreamsList[pIdx] else emptyList()
+                    val pageBoxes = mutableListOf<MatchBox>()
+                    for ((st, isXObj) in pStreams) {
+                        pageBoxes.addAll(findMatchBoxes(st, trimmedQuery, 595.5, 842.25, isXObj))
+                    }
+
+                    var count = 0
+                    var cur = 0
+                    while (cur < lowerPText.length) {
+                        val found = lowerPText.indexOf(lowerQuery, cur)
+                        if (found == -1) break
+                        count++
+
+                        val box = if (count - 1 < pageBoxes.size) {
+                            pageBoxes[count - 1]
+                        } else {
+                            val ratio = if (pText.isNotEmpty()) found.toDouble() / pText.length.toDouble() else 0.5
+                            val fallbackY = (ratio * 80.0 + 8.0).coerceIn(4.0, 92.0)
+                            MatchBox(20.0, Math.round(fallbackY * 10.0) / 10.0, (trimmedQuery.length * 1.5).coerceIn(6.0, 40.0), 1.8)
+                        }
+
+                        // Extract snippet with 35 chars context
+                        val snippetStart = (found - 35).coerceAtLeast(0)
+                        val snippetEnd = (found + lowerQuery.length + 35).coerceAtMost(pText.length)
+                        val prefix = if (snippetStart > 0) "..." else ""
+                        val suffix = if (snippetEnd < pText.length) "..." else ""
+                        val snippet = prefix + pText.substring(snippetStart, snippetEnd).trim() + suffix
+
+                        val matchMap = Arguments.createMap()
+                        matchMap.putInt("pageIndex", pIdx)
+                        matchMap.putInt("matchIndex", totalMatches + count - 1)
+                        matchMap.putString("snippet", snippet)
+                        matchMap.putDouble("x", box.x)
+                        matchMap.putDouble("y", box.y)
+                        matchMap.putDouble("width", box.width)
+                        matchMap.putDouble("height", box.height)
+                        matchesArr.pushMap(matchMap)
+
+                        cur = found + lowerQuery.length
+                    }
+
+                    val pMap = Arguments.createMap()
+                    pMap.putInt("pageIndex", pIdx)
+                    pMap.putInt("count", count)
+                    pageMatchCountsArr.pushMap(pMap)
+
+                    if (count > 0) {
+                        totalMatches += count
+                        matchingPagesArr.pushInt(pIdx)
+                    }
+                }
+
+                val res = Arguments.createMap()
+                res.putString("query", trimmedQuery)
+                res.putInt("totalMatches", totalMatches)
+                res.putArray("matchingPages", matchingPagesArr)
+                res.putArray("pageMatchCounts", pageMatchCountsArr)
+                res.putArray("matches", matchesArr)
+                promise.resolve(res)
+            } catch (e: Exception) {
+                promise.reject("SEARCH_PDF_ERROR", "Search failed: ${e.message}", e)
             }
         }
     }
@@ -1415,7 +2204,8 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 if (filePath.startsWith("content://")) {
-                    val bytes = reactContext.contentResolver.openInputStream(Uri.parse(filePath))?.use { it.readBytes() }
+                    val resolver = (currentActivity ?: reactContext).contentResolver
+                    val bytes = resolver.openInputStream(Uri.parse(filePath))?.use { it.readBytes() }
                     if (bytes != null && bytes.isNotEmpty()) {
                         val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
                         promise.resolve(b64)
@@ -1571,6 +2361,86 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
             activity.startActivityForResult(intent, PLAY_VIDEO_REQUEST)
         } catch (e: Exception) {
             promise.reject("VIDEO_LAUNCH_ERROR", "Failed to launch VideoPlayerActivity: ${e.message}", e)
+        }
+    }
+
+    @ReactMethod
+    fun probeMediaCodec(filePath: String, promise: Promise) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val extractor = android.media.MediaExtractor()
+            try {
+                val file = resolveArchiveFile(filePath)
+                if (!file.exists()) {
+                    promise.reject("FILE_NOT_FOUND", "File does not exist: $filePath")
+                    return@launch
+                }
+                extractor.setDataSource(file.absolutePath)
+                val trackCount = extractor.trackCount
+                var hasVideo = false
+                var hasAudio = false
+                var isVideoSupported = true
+                var isAudioSupported = true
+                var videoCodec = ""
+                var audioCodec = ""
+                var durationUs: Long = 0L
+
+                val codecList = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                    android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+                } else null
+
+                for (i in 0 until trackCount) {
+                    val format = extractor.getTrackFormat(i)
+                    val mime = format.getString(android.media.MediaFormat.KEY_MIME) ?: ""
+                    if (format.containsKey(android.media.MediaFormat.KEY_DURATION)) {
+                        val dur = format.getLong(android.media.MediaFormat.KEY_DURATION)
+                        if (dur > durationUs) durationUs = dur
+                    }
+
+                    if (mime.startsWith("video/")) {
+                        hasVideo = true
+                        videoCodec = mime
+                        if (codecList != null) {
+                            val decoder = codecList.findDecoderForFormat(format)
+                            if (decoder == null) {
+                                isVideoSupported = false
+                            }
+                        }
+                    } else if (mime.startsWith("audio/")) {
+                        hasAudio = true
+                        audioCodec = mime
+                        if (codecList != null) {
+                            val decoder = codecList.findDecoderForFormat(format)
+                            if (decoder == null) {
+                                isAudioSupported = false
+                            }
+                        }
+                    }
+                }
+
+                val map = Arguments.createMap()
+                map.putBoolean("hasVideo", hasVideo)
+                map.putBoolean("hasAudio", hasAudio)
+                map.putBoolean("isVideoSupported", isVideoSupported)
+                map.putBoolean("isAudioSupported", isAudioSupported)
+                map.putBoolean("isSupported", (!hasVideo || isVideoSupported) && (!hasAudio || isAudioSupported))
+                map.putString("videoCodec", videoCodec)
+                map.putString("audioCodec", audioCodec)
+                map.putDouble("durationMs", (durationUs / 1000).toDouble())
+                promise.resolve(map)
+            } catch (e: Exception) {
+                val map = Arguments.createMap()
+                map.putBoolean("hasVideo", false)
+                map.putBoolean("hasAudio", false)
+                map.putBoolean("isSupported", false)
+                map.putBoolean("isVideoSupported", false)
+                map.putBoolean("isAudioSupported", false)
+                map.putString("error", e.message ?: "Failed to probe media")
+                promise.resolve(map)
+            } finally {
+                try {
+                    extractor.release()
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -1849,6 +2719,46 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun setImmersiveMode(enabled: Boolean, promise: Promise) {
+        val activity = currentActivity
+        if (activity == null) {
+            promise.resolve(false)
+            return
+        }
+        activity.runOnUiThread {
+            try {
+                val window = activity.window ?: return@runOnUiThread
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    val controller = window.insetsController
+                    if (enabled) {
+                        controller?.hide(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+                        controller?.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    } else {
+                        controller?.show(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    if (enabled) {
+                        window.decorView.systemUiVisibility = (
+                            android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            or android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            or android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            or android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            or android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            or android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
+                        )
+                    } else {
+                        window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    }
+                }
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("IMMERSIVE_ERROR", e.message)
+            }
+        }
+    }
+
+    @ReactMethod
     fun startAudio(filePath: String, promise: Promise) {
         CoroutineScope(Dispatchers.Main).launch {
             try {
@@ -1935,6 +2845,25 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun setAudioSpeed(speed: Float, promise: Promise) {
+        CoroutineScope(Dispatchers.Main).launch {
+            try {
+                val mp = mediaPlayer
+                if (mp != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    val params = mp.playbackParams
+                    params.speed = speed.coerceIn(0.25f, 4.0f)
+                    mp.playbackParams = params
+                    promise.resolve(true)
+                } else {
+                    promise.resolve(false)
+                }
+            } catch (e: Exception) {
+                promise.reject("SET_SPEED_ERROR", e.message, e)
+            }
+        }
+    }
+
+    @ReactMethod
     fun stopAudio(promise: Promise) {
         CoroutineScope(Dispatchers.Main).launch {
             stopAudioInternal()
@@ -1982,6 +2911,7 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                 val intent = Intent(Intent.ACTION_SEND).apply {
                     type = if (!mimeType.isNullOrBlank()) mimeType else "*/*"
                     putExtra(Intent.EXTRA_STREAM, uri)
+                    clipData = ClipData.newRawUri("Shared file", uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 val chooser = Intent.createChooser(intent, "Share ${file.name}").apply {
@@ -1991,6 +2921,89 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
                 promise.resolve(true)
             } catch (e: Exception) {
                 promise.reject("SHARE_ERROR", e.message, e)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun shareMultipleFiles(filePaths: ReadableArray, mimeType: String?, promise: Promise) {
+        CoroutineScope(Dispatchers.Main).launch {
+            try {
+                val count = filePaths.size()
+                if (count == 0) {
+                    promise.resolve(false)
+                    return@launch
+                }
+
+                val context = currentActivity ?: reactContext
+                val uris = ArrayList<Uri>()
+                val authority = "${reactContext.packageName}.fileprovider"
+
+                for (i in 0 until count) {
+                    val p = filePaths.getString(i) ?: continue
+                    try {
+                        val f = resolveArchiveFile(p)
+                        if (f.exists()) {
+                            val uri = androidx.core.content.FileProvider.getUriForFile(
+                                reactContext,
+                                authority,
+                                f
+                            )
+                            uris.add(uri)
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.w("ArchiveModule", "Failed to resolve file for sharing: $p, ${e.message}")
+                    }
+                }
+
+                if (uris.isEmpty()) {
+                    promise.reject("FILES_NOT_FOUND", "None of the selected files exist")
+                    return@launch
+                }
+
+                val intent: Intent
+                val chooserTitle: String
+
+                if (uris.size == 1) {
+                    intent = Intent(Intent.ACTION_SEND).apply {
+                        type = if (!mimeType.isNullOrBlank()) mimeType else "*/*"
+                        putExtra(Intent.EXTRA_STREAM, uris[0])
+                        clipData = ClipData.newRawUri("Shared file", uris[0])
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    chooserTitle = "Share file"
+                } else {
+                    intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                        type = if (!mimeType.isNullOrBlank()) mimeType else "*/*"
+                        putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                        val clip = ClipData.newRawUri("Shared file 0", uris[0])
+                        for (j in 1 until uris.size) {
+                            clip.addItem(ClipData.Item(uris[j]))
+                        }
+                        clipData = clip
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    chooserTitle = "Share ${uris.size} files"
+                }
+
+                val chooser = Intent.createChooser(intent, chooserTitle).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    if (intent.clipData != null) {
+                        clipData = intent.clipData
+                    }
+                }
+
+                for (u in uris) {
+                    try {
+                        context.grantUriPermission(context.packageName, u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    } catch (_: Exception) {}
+                }
+
+                context.startActivity(chooser)
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("SHARE_MULTIPLE_ERROR", e.message, e)
             }
         }
     }
@@ -2038,55 +3051,63 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    fun processIncomingIntent(intent: Intent) {
-        val uri: Uri? = when (intent.action) {
-            Intent.ACTION_VIEW -> intent.data
-            Intent.ACTION_SEND -> {
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java) ?: intent.data
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: intent.data
-                }
-            }
-            else -> intent.data
-        }
+    @ReactMethod
+    fun addListener(eventName: String) {
+        // Required for React Native built-in NativeEventEmitter calls
+    }
 
+    @ReactMethod
+    fun removeListeners(count: Int) {
+        // Required for React Native built-in NativeEventEmitter calls
+    }
+
+    fun processIncomingIntent(intent: Intent) {
+        val uri: Uri? = com.ufv_rn_poc.MainActivity.extractUriFromIntent(intent)
         if (uri != null) {
-            val map = Arguments.createMap()
-            map.putString("uri", uri.toString())
-            map.putString("action", intent.action)
-            map.putString("mimeType", intent.type)
-            sendEvent("onSharedFile", map)
+            val cached = cacheIncomingUri(currentActivity ?: reactContext, uri, intent.type)
+            if (cached != null) {
+                val map = Arguments.createMap().apply {
+                    putString("uri", "file://${cached.file.absolutePath}")
+                    putString("path", cached.file.absolutePath)
+                    putString("name", cached.name)
+                    putDouble("size", cached.size.toDouble())
+                    putString("mimeType", cached.mimeType)
+                    putString("action", intent.action)
+                }
+                sendEvent("onSharedFile", map)
+            }
         }
     }
 
     @ReactMethod
     fun getInitialSharedFile(promise: Promise) {
         try {
+            val cached = com.ufv_rn_poc.MainActivity.cachedSharedFile
+            if (cached != null) {
+                com.ufv_rn_poc.MainActivity.cachedSharedFile = null
+                promise.resolve(cached)
+                return
+            }
             val act = currentActivity
-            val intent = act?.intent
-            if (intent != null && (intent.action == Intent.ACTION_VIEW || intent.action == Intent.ACTION_SEND)) {
-                val uri: Uri? = if (intent.action == Intent.ACTION_SEND) {
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                        intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java) ?: intent.data
-                    } else {
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: intent.data
-                    }
-                } else {
-                    intent.data
-                }
-
+            val incomingIntent = com.ufv_rn_poc.MainActivity.initialIntent ?: act?.intent
+            if (incomingIntent != null) {
+                val uri: Uri? = com.ufv_rn_poc.MainActivity.extractUriFromIntent(incomingIntent)
                 if (uri != null) {
-                    val map = Arguments.createMap()
-                    map.putString("uri", uri.toString())
-                    map.putString("action", intent.action)
-                    map.putString("mimeType", intent.type)
-                    // Consume intent so it does not repeat
-                    act.intent = Intent(Intent.ACTION_MAIN)
-                    promise.resolve(map)
-                    return
+                    val context = act ?: reactContext
+                    val cachedInfo = cacheIncomingUri(context, uri, incomingIntent.type)
+                    if (cachedInfo != null) {
+                        val map = Arguments.createMap().apply {
+                            putString("uri", "file://${cachedInfo.file.absolutePath}")
+                            putString("path", cachedInfo.file.absolutePath)
+                            putString("name", cachedInfo.name)
+                            putDouble("size", cachedInfo.size.toDouble())
+                            putString("mimeType", cachedInfo.mimeType)
+                            putString("action", incomingIntent.action)
+                        }
+                        com.ufv_rn_poc.MainActivity.initialIntent = null
+                        promise.resolve(map)
+                        return
+                    }
                 }
             }
             promise.resolve(null)
@@ -2101,80 +3122,43 @@ class ArchiveModule(private val reactContext: ReactApplicationContext) :
             try {
                 val uri = Uri.parse(uriString)
 
-                // Low storage check (<25MB free)
-                val stat = android.os.StatFs(reactContext.cacheDir.path)
-                val freeMb = (stat.availableBlocksLong * stat.blockSizeLong) / (1024 * 1024)
-                if (freeMb < 25) {
-                    promise.reject("LOW_STORAGE", "Device storage is critically low (<25MB free).")
-                    return@launch
+                // 1. If already a direct local file
+                if (uri.scheme == "file" || uri.scheme.isNullOrBlank()) {
+                    val rawPath = uri.path ?: uriString.removePrefix("file://")
+                    val f = File(rawPath)
+                    if (f.exists()) {
+                        val map = Arguments.createMap().apply {
+                            putString("path", f.absolutePath)
+                            putString("name", f.name)
+                            putDouble("size", f.length().toDouble())
+                        }
+                        promise.resolve(map)
+                        return@launch
+                    }
                 }
 
-                val type = reactContext.contentResolver.getType(uri) ?: ""
-                // For large media (audio/video), pass content URI directly to avoid copying gigabytes
-                if (type.startsWith("audio/") || type.startsWith("video/")) {
-                    val rawName = getFileName(uri) ?: "media_${System.currentTimeMillis()}"
+                // 2. Cache incoming content URI safely
+                val context = currentActivity ?: reactContext
+                val cached = cacheIncomingUri(context, uri, null)
+                if (cached != null && cached.file.exists()) {
                     val map = Arguments.createMap().apply {
-                        putString("path", uriString)
-                        putString("name", rawName)
-                        putDouble("size", 0.0)
+                        putString("path", cached.file.absolutePath)
+                        putString("name", cached.name)
+                        putDouble("size", cached.size.toDouble())
+                        putString("mimeType", cached.mimeType)
                     }
                     promise.resolve(map)
                     return@launch
                 }
 
-                if (uri.scheme == "content") {
-                    val rawName = getFileName(uri) ?: "doc_${System.currentTimeMillis()}"
-                    val sanitized = rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                    val incomingDir = File(reactContext.cacheDir, "incoming")
-                    if (!incomingDir.exists()) incomingDir.mkdirs()
-                    val destFile = File(incomingDir, "shared_in_$sanitized")
-
-                    reactContext.contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(destFile).use { output ->
-                            val buffer = ByteArray(64 * 1024)
-                            var read: Int
-                            var total = 0L
-                            val maxCap = 500L * 1024L * 1024L // 500MB cap
-                            while (input.read(buffer).also { read = it } != -1) {
-                                total += read
-                                if (total > maxCap) {
-                                    output.close()
-                                    destFile.delete()
-                                    promise.reject("FILE_TOO_LARGE", "Shared file exceeds 500MB safety limit.")
-                                    return@launch
-                                }
-                                output.write(buffer, 0, read)
-                            }
-                        }
-                    }
-
-                    if (destFile.exists() && destFile.length() > 0) {
-                        val map = Arguments.createMap()
-                        map.putString("path", destFile.absolutePath)
-                        map.putString("name", sanitized)
-                        map.putDouble("size", destFile.length().toDouble())
-                        promise.resolve(map)
-                        return@launch
-                    }
-                } else if (uri.scheme == "file") {
-                    val rawPath = uri.path ?: uriString.removePrefix("file://")
-                    val f = File(rawPath)
-                    if (f.exists()) {
-                        val map = Arguments.createMap()
-                        map.putString("path", f.absolutePath)
-                        map.putString("name", f.name)
-                        map.putDouble("size", f.length().toDouble())
-                        promise.resolve(map)
-                        return@launch
-                    }
-                }
-                // Fallback: treat as plain path
+                // 3. Fallback: plain file check
                 val clean = if (uriString.startsWith("file://")) uriString.removePrefix("file://") else uriString
                 val f = File(clean)
-                val map = Arguments.createMap()
-                map.putString("path", f.absolutePath)
-                map.putString("name", f.name)
-                map.putDouble("size", if (f.exists()) f.length().toDouble() else 0.0)
+                val map = Arguments.createMap().apply {
+                    putString("path", f.absolutePath)
+                    putString("name", f.name)
+                    putDouble("size", if (f.exists()) f.length().toDouble() else 0.0)
+                }
                 promise.resolve(map)
             } catch (e: Exception) {
                 promise.reject("RESOLVE_URI_FAILED", "Could not resolve URI $uriString: ${e.message}", e)

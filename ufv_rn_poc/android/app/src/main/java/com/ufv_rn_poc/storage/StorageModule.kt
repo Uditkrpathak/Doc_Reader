@@ -26,11 +26,13 @@ class StorageModule(private val reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "StorageModule"
         private const val REQUEST_CODE_SAF_TREE = 9021
+        private const val REQUEST_CODE_MANAGE_ALL_FILES = 9022
         private const val PREFS_NAME = "ufv_storage_prefs"
         private const val KEY_SAF_TREE_URI = "saf_tree_uri"
     }
 
     private var pendingTreePromise: Promise? = null
+    private var pendingAllFilesPromise: Promise? = null
 
     init {
         reactContext.addActivityEventListener(this)
@@ -70,6 +72,22 @@ class StorageModule(private val reactContext: ReactApplicationContext) :
                 putString("uri", null)
             }
             promise?.resolve(result)
+            return
+        }
+
+        if (requestCode == REQUEST_CODE_MANAGE_ALL_FILES) {
+            val promise = pendingAllFilesPromise
+            pendingAllFilesPromise = null
+            val isGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                ContextCompat.checkSelfPermission(reactContext, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+            }
+            val result = Arguments.createMap().apply {
+                putBoolean("granted", isGranted)
+            }
+            promise?.resolve(result)
+            return
         }
     }
 
@@ -157,6 +175,48 @@ class StorageModule(private val reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             pendingTreePromise = null
             promise.reject("SAF_REQUEST_ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun requestAllFilesAccess(promise: Promise) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
+                val result = Arguments.createMap().apply {
+                    putBoolean("granted", true)
+                }
+                promise.resolve(result)
+                return
+            }
+            val activity = currentActivity
+            if (activity == null) {
+                promise.reject("ACTIVITY_UNAVAILABLE", "Activity is null")
+                return
+            }
+            try {
+                pendingAllFilesPromise = promise
+                try {
+                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                        data = Uri.parse("package:${reactContext.packageName}")
+                    }
+                    activity.startActivityForResult(intent, REQUEST_CODE_MANAGE_ALL_FILES)
+                } catch (e: Exception) {
+                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    activity.startActivityForResult(intent, REQUEST_CODE_MANAGE_ALL_FILES)
+                }
+            } catch (e: Exception) {
+                pendingAllFilesPromise = null
+                promise.reject("MANAGE_ALL_FILES_ERROR", e.message, e)
+            }
+        } else {
+            val granted = ContextCompat.checkSelfPermission(
+                reactContext,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+            val result = Arguments.createMap().apply {
+                putBoolean("granted", granted)
+            }
+            promise.resolve(result)
         }
     }
 

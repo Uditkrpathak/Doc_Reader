@@ -24,9 +24,9 @@ export interface StatResult {
 export class RNFSService {
   public static MainBundlePath = '';
   public static CachesDirectoryPath = '/data/user/0/com.ufv_rn_poc/cache';
-  public static DocumentDirectoryPath = '/sdcard';
-  public static DownloadDirectoryPath = '/sdcard/Download';
-  public static ExternalStorageDirectoryPath = '/sdcard';
+  public static DocumentDirectoryPath = '/storage/emulated/0';
+  public static DownloadDirectoryPath = '/storage/emulated/0/Download';
+  public static ExternalStorageDirectoryPath = '/storage/emulated/0';
   public static TemporaryDirectoryPath = '/data/local/tmp';
 
   public static async readDir(dirPath: string): Promise<ReadDirItem[]> {

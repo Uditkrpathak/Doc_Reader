@@ -10,9 +10,7 @@ import {
   ToastAndroid,
   Platform,
 } from 'react-native';
-import { NativeModules } from 'react-native';
-
-const { ArchiveModule } = NativeModules;
+import { ArchiveEngine } from '../services/ArchiveEngine';
 
 export interface FileDetailsItem {
   name: string;
@@ -70,8 +68,8 @@ export const FileDetailsModal: React.FC<FileDetailsModalProps> = ({
 
   const handleShare = async () => {
     try {
-      if (Platform.OS === 'android' && ArchiveModule?.shareFile) {
-        await ArchiveModule.shareFile(file.path, file.mimeType || '*/*');
+      if (Platform.OS === 'android') {
+        await ArchiveEngine.getInstance().shareFile(file.path, file.mimeType || '*/*');
       } else {
         await Share.share({
           title: file.name,

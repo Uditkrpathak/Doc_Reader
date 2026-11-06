@@ -131,6 +131,11 @@ class MMKVStorage {
     this.set(STORAGE_FILE_KEY, JSON.stringify(updated));
   }
 
+  public removeRecentFile(path: string): void {
+    const recents = this.getRecentFiles().filter((r) => r.path !== path);
+    this.set(STORAGE_FILE_KEY, JSON.stringify(recents));
+  }
+
   public clearRecentFiles(): void {
     this.delete(STORAGE_FILE_KEY);
   }
@@ -153,6 +158,13 @@ class MMKVStorage {
     return starred.some((s) => s.path === path);
   }
 
+  public areAllStarred(paths: string[]): boolean {
+    if (!paths || paths.length === 0) return false;
+    const starred = this.getStarredFiles();
+    const set = new Set(starred.map((s) => s.path));
+    return paths.every((p) => set.has(p));
+  }
+
   public toggleStarred(file: RecentFile): boolean {
     const starred = this.getStarredFiles();
     const existingIndex = starred.findIndex((s) => s.path === file.path);
@@ -164,6 +176,42 @@ class MMKVStorage {
       starred.unshift(file);
       this.set(STORAGE_STARRED_KEY, JSON.stringify(starred));
       return true;
+    }
+  }
+
+  public addStarredBatch(files: RecentFile[]): void {
+    if (!files || files.length === 0) return;
+    const starred = this.getStarredFiles();
+    const existingPaths = new Set(starred.map((s) => s.path));
+    const toAdd: RecentFile[] = [];
+    for (const f of files) {
+      if (!existingPaths.has(f.path)) {
+        existingPaths.add(f.path);
+        toAdd.push(f);
+      }
+    }
+    if (toAdd.length > 0) {
+      const updated = [...toAdd, ...starred];
+      this.set(STORAGE_STARRED_KEY, JSON.stringify(updated));
+    }
+  }
+
+  public removeStarredBatch(paths: string[]): void {
+    if (!paths || paths.length === 0) return;
+    const toRemove = new Set(paths);
+    const starred = this.getStarredFiles().filter((s) => !toRemove.has(s.path));
+    this.set(STORAGE_STARRED_KEY, JSON.stringify(starred));
+  }
+
+  public toggleStarredBatch(files: RecentFile[]): { added: boolean; count: number } {
+    if (!files || files.length === 0) return { added: false, count: 0 };
+    const paths = files.map((f) => f.path);
+    if (this.areAllStarred(paths)) {
+      this.removeStarredBatch(paths);
+      return { added: false, count: files.length };
+    } else {
+      this.addStarredBatch(files);
+      return { added: true, count: files.length };
     }
   }
 

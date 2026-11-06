@@ -1,32 +1,27 @@
-import React, {useState, useEffect} from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
   View,
-  TextInput,
   TouchableOpacity,
   Platform,
-  ActivityIndicator,
   Modal,
   Linking,
-  AppState,
   NativeEventEmitter,
   NativeModules,
 } from 'react-native';
-import {
-  ArchiveEngine,
-  ExtractionResult,
-  ArchiveEntry,
-  FolderFile,
-  PickedFile,
-} from './src/services/ArchiveEngine';
+import { ArchiveEngine } from './src/services/ArchiveEngine';
+import { FileDetector } from './src/services/FileDetector';
 import { RarViewerScreen } from './src/screens/RarViewerScreen';
 import { ZipViewerScreen } from './src/screens/ZipViewerScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { FolderBrowserScreen } from './src/screens/FolderBrowserScreen';
+import { MediaScreen } from './src/screens/MediaScreen';
+import { FavouritesScreen } from './src/screens/FavouritesScreen';
+import { WelcomeScreen } from './src/screens/WelcomeScreen';
+import { UnsupportedFileScreen } from './src/screens/UnsupportedFileScreen';
 import { AudioMiniPlayer } from './src/components/AudioMiniPlayer';
 import { MediaViewer } from './src/viewers/MediaViewer';
 import { PdfViewer } from './src/viewers/PdfViewer';
@@ -36,29 +31,24 @@ import { CsvViewer } from './src/screens/CsvViewer';
 import { ImageViewer } from './src/viewers/ImageViewer';
 import { TextViewer } from './src/viewers/TextViewer';
 import { MMKV } from './src/services/MMKV';
-
-interface BenchmarkRecord {
-  file: string;
-  format: string;
-  status: string;
-  latencyMs: number;
-  extractedCount: number;
-  log: string;
-}
+import { FigmaTheme } from './src/theme/FigmaTheme';
+import {
+  HomeOutlineIcon,
+  BrowseFolderIcon,
+  MediaPhotosIcon,
+  StarOutlineIcon,
+} from './src/components/AppIcons';
 
 export default function App(): React.JSX.Element {
-  const [activeTab, setActiveTab] = useState<'HOME' | 'BROWSE' | 'STARRED' | 'ARCHIVE'>('HOME');
-  const [records, setRecords] = useState<BenchmarkRecord[]>([]);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [activeFileName, setActiveFileName] = useState<string>('');
-  const [progressMsg, setProgressMsg] = useState<string>('Ready');
-  const [folderFiles, setFolderFiles] = useState<FolderFile[]>([]);
-  const [currentFolder] = useState<string>('/sdcard/Download');
-  const [isScanningFolder, setIsScanningFolder] = useState<boolean>(false);
+  const [hasSeenWelcome, setHasSeenWelcome] = useState<boolean>(() =>
+    Boolean(MMKV.getBoolean('has_seen_welcome_v1'))
+  );
 
-  // User Picked File & Password
-  const [pickedFile, setPickedFile] = useState<PickedFile | null>(null);
-  const [password, setPassword] = useState<string>('');
+  const [activeTab, setActiveTab] = useState<'HOME' | 'BROWSE' | 'MEDIA' | 'FAVOURITES'>('HOME');
+  const [browseCategory, setBrowseCategory] = useState<string | undefined>(undefined);
+  const [browseShowRecents, setBrowseShowRecents] = useState<boolean>(false);
+  const [isBrowserSelectionMode, setIsBrowserSelectionMode] = useState<boolean>(false);
+
   const [viewingArchive, setViewingArchive] = useState<{
     path: string;
     name: string;
@@ -69,7 +59,7 @@ export default function App(): React.JSX.Element {
     path: string;
   } | null>(null);
 
-  // External Intent / WhatsApp "Open With" (Master PRD Section 2.2)
+  // External Intent / WhatsApp / Telegram "Open With"
   const [externalViewer, setExternalViewer] = useState<{
     file: string;
     path: string;
@@ -78,47 +68,73 @@ export default function App(): React.JSX.Element {
   } | null>(null);
 
   const engine = ArchiveEngine.getInstance();
+  const lastHandledUrlRef = useRef<{ url: string; time: number } | null>(null);
 
   const handleIncomingUrl = async (url: string | null) => {
     if (!url) return;
+    const now = Date.now();
+    // Debounce duplicate invocations for the exact same URI within 3 seconds
+    if (
+      lastHandledUrlRef.current &&
+      lastHandledUrlRef.current.url === url &&
+      now - lastHandledUrlRef.current.time < 3000
+    ) {
+      return;
+    }
+    lastHandledUrlRef.current = { url, time: now };
+
     try {
       const resolved = await engine.resolveContentUri(url);
-      const ext = (resolved.name.split('.').pop() || '').toLowerCase();
       let category = 'PDF';
-      let formatType = undefined;
+      let formatType: any = undefined;
 
-      if (['pdf'].includes(ext)) {
-        category = 'PDF';
-      } else if (['docx'].includes(ext)) {
-        category = 'OFFICE_DOCX';
+      try {
+        const detected = await FileDetector.detectFile(resolved.path, resolved.name);
+        category = detected.category;
+      } catch {
+        // Fallback to extension check
+        const ext = (resolved.name.split('.').pop() || '').toLowerCase();
+        if (['pdf'].includes(ext)) {
+          category = 'PDF';
+        } else if (['docx'].includes(ext)) {
+          category = 'OFFICE_DOCX';
+        } else if (['doc'].includes(ext)) {
+          category = 'LEGACY_OLE_DOC';
+        } else if (['pptx'].includes(ext)) {
+          category = 'OFFICE_PPTX';
+        } else if (['ppt'].includes(ext)) {
+          category = 'LEGACY_OLE_PPT';
+        } else if (['xlsx'].includes(ext)) {
+          category = 'OFFICE_XLSX';
+        } else if (['xls'].includes(ext)) {
+          category = 'LEGACY_OLE_XLS';
+        } else if (['csv', 'tsv'].includes(ext)) {
+          category = 'SPREADSHEET_CSV';
+        } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic'].includes(ext)) {
+          category = 'IMAGE';
+        } else if (['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) {
+          category = 'VIDEO';
+        } else if (['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg'].includes(ext)) {
+          category = 'AUDIO';
+        } else if (['zip'].includes(ext)) {
+          category = 'ARCHIVE_ZIP';
+        } else if (['rar'].includes(ext)) {
+          category = 'ARCHIVE_RAR';
+        } else {
+          category = 'TEXT_CODE';
+        }
+      }
+
+      if (category === 'OFFICE_DOCX') {
         formatType = 'DOCX';
-      } else if (['doc'].includes(ext)) {
-        category = 'LEGACY_OLE_DOC';
-        formatType = 'DOC';
-      } else if (['pptx'].includes(ext)) {
-        category = 'OFFICE_PPTX';
+      } else if (category === 'OFFICE_PPTX') {
         formatType = 'PPTX';
-      } else if (['ppt'].includes(ext)) {
-        category = 'LEGACY_OLE_PPT';
+      } else if (category === 'LEGACY_OLE_DOC') {
+        formatType = 'DOC';
+      } else if (category === 'LEGACY_OLE_PPT') {
         formatType = 'PPT';
-      } else if (['xlsx'].includes(ext)) {
-        category = 'OFFICE_XLSX';
-      } else if (['xls'].includes(ext)) {
-        category = 'LEGACY_OLE_XLS';
-      } else if (['csv', 'tsv'].includes(ext)) {
-        category = 'SPREADSHEET_CSV';
-      } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic'].includes(ext)) {
-        category = 'IMAGE';
-      } else if (['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) {
-        category = 'VIDEO';
-      } else if (['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg'].includes(ext)) {
-        category = 'AUDIO';
-      } else if (['zip'].includes(ext)) {
-        category = 'ARCHIVE_ZIP';
-      } else if (['rar'].includes(ext)) {
+      } else if (category === 'ARCHIVE_RAR4' || category === 'ARCHIVE_RAR5') {
         category = 'ARCHIVE_RAR';
-      } else {
-        category = 'TEXT_CODE';
       }
 
       // Add to MMKV recents
@@ -172,151 +188,27 @@ export default function App(): React.JSX.Element {
       }
     }
 
-    // 5. Stop background audio on app exit/task removed
-    const appStateSub = AppState.addEventListener('change', (nextState) => {
-      if (nextState === 'background' || nextState === 'inactive') {
-        // App lifecycle background state
-      }
-    });
-
     return () => {
       urlSub.remove();
       sharedSub?.remove();
-      appStateSub.remove();
     };
   }, []);
 
-  const handlePickFile = async () => {
-    try {
-      const res = await engine.pickFile();
-      setPickedFile(res);
-      setProgressMsg(`Selected: ${res.name} (${(res.size / 1024).toFixed(1)} KB)`);
-    } catch (err: any) {
-      if (err.code !== 'PICK_CANCELLED') {
-        console.warn('Pick file error:', err);
-      }
-    }
-  };
-
-  const loadFolderFiles = async (folderPath: string = currentFolder) => {
-    setIsScanningFolder(true);
-    try {
-      let files = await engine.listFolder(folderPath);
-      setFolderFiles(files);
-    } catch (err) {
-      console.warn('Failed to load folder:', err);
-    } finally {
-      setIsScanningFolder(false);
-    }
-  };
-
-  useEffect(() => {
-    loadFolderFiles('/sdcard/Download');
-  }, []);
-
-  const runArchiveTest = async (
-    fileName: string,
-    filePath: string,
-    testPassword?: string
-  ) => {
-    setIsRunning(true);
-    setActiveFileName(fileName);
-    setProgressMsg(`Starting ${fileName}...`);
-    const start = Date.now();
-    const effectivePass = testPassword !== undefined ? testPassword : password;
-
-    try {
-      // 1. List
-      let format = 'ZIP';
-      try {
-        const entries: ArchiveEntry[] = await engine.list(filePath, effectivePass);
-        if (entries.length > 0 && entries[0].format) {
-          format = entries[0].format;
-        }
-      } catch (listErr: any) {
-        format = fileName.toLowerCase().endsWith('.rar') ? 'RAR' : 'ZIP';
-      }
-
-      // 2. Extract to isolated cache directory
-      const destDir = `/data/data/com.ufv_rn_poc/cache/extract_${Date.now()}`;
-      const res: ExtractionResult = await engine.extract(
-        filePath,
-        destDir,
-        effectivePass,
-        {maxExpansionRatio: 100.0},
-        (prog) => {
-          setProgressMsg(
-            `Extracting ${fileName}: ${prog.entriesProcessed} entries (${(
-              prog.bytesExtracted /
-              (1024 * 1024)
-            ).toFixed(1)} MB)`
-          );
-        }
-      );
-
-      const elapsed = Date.now() - start;
-
-      const record: BenchmarkRecord = {
-        file: fileName,
-        format: format || 'ZIP',
-        status: res.status,
-        latencyMs: elapsed,
-        extractedCount: res.extractedFiles ? res.extractedFiles.length : 0,
-        log:
-          res.error ||
-          `Extracted ${res.extractedFiles?.length || 0} entries successfully (${(
-            res.totalBytesExtracted /
-            (1024 * 1024)
-          ).toFixed(2)} MB in ${(elapsed / 1000).toFixed(1)}s).`,
-      };
-
-      setRecords((prev) => [record, ...prev]);
-    } catch (err: any) {
-      const elapsed = Date.now() - start;
-      const record: BenchmarkRecord = {
-        file: fileName,
-        format: 'UNKNOWN',
-        status: 'ERROR',
-        latencyMs: elapsed,
-        extractedCount: 0,
-        log: err.message || String(err),
-      };
-      setRecords((prev) => [record, ...prev]);
-    } finally {
-      setIsRunning(false);
-      setActiveFileName('');
-      setProgressMsg('Extraction Finished');
-    }
-  };
-
-  const cancelActiveExtraction = async () => {
-    await engine.cancel();
-    setProgressMsg('Extraction cancelled by user');
-  };
-
-  const testAllInFolder = async () => {
-    for (const f of folderFiles) {
-      if (f.isArchive || f.name.endsWith('.zip') || f.name.endsWith('.rar')) {
-        await runArchiveTest(f.name, f.path, password);
-      }
-    }
-  };
-
-  const clearResults = () => {
-    setRecords([]);
-  };
-
   const navigation = {
-    navigate: (screen: string, _params?: any) => {
+    navigate: (screen: string, params?: any) => {
       const s = (screen || '').toUpperCase();
-      if (s.includes('STAR')) {
-        setActiveTab('STARRED');
-      } else if (s.includes('HOME')) {
-        setActiveTab('HOME');
+      if (params?.category) {
+        setBrowseCategory(params.category);
+      } else {
+        setBrowseCategory(undefined);
+      }
+      setBrowseShowRecents(Boolean(params?.showRecents));
+      if (s.includes('FAV') || s.includes('STAR')) {
+        setActiveTab('FAVOURITES');
+      } else if (s.includes('MEDIA') || s.includes('IMAGE') || s.includes('VIDEO')) {
+        setActiveTab('MEDIA');
       } else if (s.includes('BROWSE') || s.includes('FOLDER') || s.includes('FILE')) {
         setActiveTab('BROWSE');
-      } else if (s.includes('ARCHIVE')) {
-        setActiveTab('ARCHIVE');
       } else {
         setActiveTab('HOME');
       }
@@ -326,228 +218,56 @@ export default function App(): React.JSX.Element {
     },
   };
 
+  useEffect(() => {
+    engine.setImmersiveMode(true);
+  }, [engine]);
+
+  // First launch welcome screen (Figma Screen 1) - only show if not directly opening an external file
+  if (!hasSeenWelcome && !externalViewer) {
+    return (
+      <WelcomeScreen
+        onBrowseFiles={() => {
+          MMKV.set('has_seen_welcome_v1', true);
+          setHasSeenWelcome(true);
+          setActiveTab('BROWSE');
+        }}
+        onOpenFromAnotherApp={async () => {
+          MMKV.set('has_seen_welcome_v1', true);
+          setHasSeenWelcome(true);
+          try {
+            const picked = await engine.pickFile();
+            if (picked?.path) {
+              await handleIncomingUrl(picked.path);
+            } else {
+              setActiveTab('HOME');
+            }
+          } catch {
+            setActiveTab('HOME');
+          }
+        }}
+      />
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" backgroundColor="#f8fafc" />
-      {activeTab !== 'HOME' && (
-        <View style={styles.header}>
-          <View style={styles.headerTitleRow}>
-            <View>
-              <Text style={styles.title}>Universal File Viewer</Text>
-              <Text style={styles.subtitle}>Fast, Offline Document & Media Reader</Text>
-            </View>
-            <View style={styles.offlinePill}>
-              <Text style={styles.offlinePillText}>🔒 100% Offline</Text>
-            </View>
-          </View>
-        </View>
-      )}
+      <StatusBar hidden={true} />
 
       <View style={styles.body}>
         {activeTab === 'HOME' ? (
           <HomeScreen navigation={navigation} />
         ) : activeTab === 'BROWSE' ? (
-          <FolderBrowserScreen navigation={navigation} />
-        ) : activeTab === 'STARRED' ? (
-          <HomeScreen navigation={navigation} initialCategory="STARRED" />
+          <FolderBrowserScreen
+            navigation={navigation}
+            initialCategory={browseCategory}
+            showRecents={browseShowRecents}
+            onSelectionModeChange={setIsBrowserSelectionMode}
+          />
+        ) : activeTab === 'MEDIA' ? (
+          <MediaScreen navigation={navigation} />
         ) : (
-          <ScrollView contentContainerStyle={styles.content}>
-        {/* Active Progress Card */}
-        {isRunning && (
-          <View style={styles.activeCard}>
-            <View style={styles.activeHeader}>
-              <ActivityIndicator color="#1a73e8" size="small" />
-              <Text style={styles.activeTitle}>Extracting: {activeFileName}</Text>
-            </View>
-            <Text style={styles.activeMsg}>{progressMsg}</Text>
-            <TouchableOpacity style={styles.cancelButton} onPress={cancelActiveExtraction}>
-              <Text style={styles.cancelButtonText}>🛑 CANCEL EXTRACTION</Text>
-            </TouchableOpacity>
-          </View>
+          <FavouritesScreen navigation={navigation} />
         )}
-
-        {/* 1. Pick Any File From Storage */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>📂 Pick Any File From Device</Text>
-          <Text style={styles.cardDesc}>
-            Select your own ZIP, AES-256 encrypted ZIP, or RAR file from phone storage or Downloads.
-          </Text>
-
-          <TouchableOpacity style={styles.pickButton} onPress={handlePickFile}>
-            <Text style={styles.pickButtonText}>📂 SELECT FILE FROM STORAGE</Text>
-          </TouchableOpacity>
-
-          {pickedFile && (
-            <View style={styles.pickedFileBox}>
-              <Text style={styles.pickedFileName}>Selected: {pickedFile.name}</Text>
-              <Text style={styles.pickedFileSize}>
-                {(pickedFile.size / (1024 * 1024)).toFixed(2)} MB ({pickedFile.size} bytes)
-              </Text>
-            </View>
-          )}
-
-          <View style={styles.passwordRow}>
-            <Text style={styles.inputLabel}>Password (if file is encrypted):</Text>
-            <TextInput
-              style={styles.passwordInput}
-              placeholder="e.g. 1234"
-              placeholderTextColor="#9aa0a6"
-              value={password}
-              onChangeText={setPassword}
-            />
-          </View>
-
-          <TouchableOpacity
-            style={[
-              styles.primaryButton,
-              (!pickedFile || isRunning) && styles.disabledButton,
-            ]}
-            disabled={!pickedFile || isRunning}
-            onPress={() => runArchiveTest(pickedFile!.name, pickedFile!.path, password)}>
-            {isRunning && activeFileName === pickedFile?.name ? (
-              <ActivityIndicator color="#ffffff" size="small" />
-            ) : (
-              <Text style={styles.primaryButtonText}>⚡ EXTRACT SELECTED FILE</Text>
-            )}
-          </TouchableOpacity>
-
-          {pickedFile &&
-            (pickedFile.name.toLowerCase().endsWith('.rar') ||
-              pickedFile.name.toLowerCase().endsWith('.zip')) && (
-              <TouchableOpacity
-                style={[styles.primaryButton, { backgroundColor: '#0284c7', marginTop: 8 }]}
-                onPress={() =>
-                  setViewingArchive({
-                    path: pickedFile.path,
-                    name: pickedFile.name,
-                    isRar: pickedFile.name.toLowerCase().endsWith('.rar'),
-                  })
-                }>
-                <Text style={styles.primaryButtonText}>
-                  👁️ BROWSE & VIEW ARCHIVE CONTENTS
-                </Text>
-              </TouchableOpacity>
-            )}
-        </View>
-
-        {/* 2. Live Drop Folder (/sdcard/Download) */}
-        <View style={styles.card}>
-          <View style={styles.folderHeader}>
-            <View>
-              <Text style={styles.cardTitle}>📁 Download Folder (/sdcard/Download)</Text>
-              <Text style={styles.folderTip}>
-                Drag & drop files from your computer onto this emulator window to test them.
-              </Text>
-            </View>
-            <TouchableOpacity
-              style={styles.refreshButton}
-              disabled={isScanningFolder}
-              onPress={() => loadFolderFiles('/sdcard/Download')}>
-              {isScanningFolder ? (
-                <ActivityIndicator color="#1a73e8" size="small" />
-              ) : (
-                <Text style={styles.refreshButtonText}>🔄 Refresh</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-
-          {folderFiles.length > 0 ? (
-            <View style={styles.fileList}>
-              <TouchableOpacity
-                style={[styles.testAllBtn, isRunning && styles.disabledButton]}
-                disabled={isRunning}
-                onPress={testAllInFolder}>
-                <Text style={styles.testAllBtnText}>⚡ EXTRACT ALL FILES IN DOWNLOAD FOLDER</Text>
-              </TouchableOpacity>
-
-              {folderFiles.map((f, idx) => (
-                <View key={idx} style={styles.fileRow}>
-                  <View style={styles.fileInfo}>
-                    <Text style={styles.fileNameText}>{f.name}</Text>
-                    <Text style={styles.fileSizeText}>
-                      {(f.size / (1024 * 1024)).toFixed(2)} MB • {f.extension.toUpperCase()}
-                    </Text>
-                  </View>
-                  <View style={{ flexDirection: 'row', gap: 6 }}>
-                    {(f.extension.toLowerCase() === 'rar' || f.extension.toLowerCase() === 'zip') && (
-                      <TouchableOpacity
-                        style={[styles.testSingleBtn, { backgroundColor: '#0284c7' }]}
-                        onPress={() =>
-                          setViewingArchive({
-                            path: f.path,
-                            name: f.name,
-                            isRar: f.extension.toLowerCase() === 'rar',
-                          })
-                        }>
-                        <Text style={styles.testSingleBtnText}>👁️ View</Text>
-                      </TouchableOpacity>
-                    )}
-                    <TouchableOpacity
-                      style={[styles.testSingleBtn, isRunning && styles.disabledButton]}
-                      disabled={isRunning}
-                      onPress={() => runArchiveTest(f.name, f.path, password)}>
-                      <Text style={styles.testSingleBtnText}>▶ Extract</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              ))}
-            </View>
-          ) : (
-            <View style={styles.emptyBox}>
-              <Text style={styles.emptyFolderText}>
-                No files found in /sdcard/Download.
-              </Text>
-              <Text style={styles.emptyFolderSubText}>
-                Drag & drop any ZIP, RAR, or test files into the emulator, then tap "Refresh".
-              </Text>
-            </View>
-          )}
-        </View>
-
-        {/* 3. Real Results Table */}
-        <View style={styles.card}>
-          <View style={styles.tableHeaderRow}>
-            <Text style={styles.cardTitle}>Real Extraction Results</Text>
-            {records.length > 0 && (
-              <TouchableOpacity onPress={clearResults}>
-                <Text style={styles.clearText}>Clear</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-
-          {records.length === 0 ? (
-            <Text style={styles.emptyText}>
-              No tests run yet. Pick a file above or click Extract on any file in the Download folder.
-            </Text>
-          ) : (
-            records.map((r, i) => (
-              <View key={i} style={styles.recordRow}>
-                <View style={styles.recordHeader}>
-                  <Text style={styles.fileName}>{r.file}</Text>
-                  <View
-                    style={[
-                      styles.statusBadge,
-                      r.status === 'SUCCESS'
-                        ? styles.passBadge
-                        : r.status === 'BLOCKED'
-                        ? styles.blockedBadge
-                        : styles.errorBadge,
-                    ]}>
-                    <Text style={styles.statusBadgeText}>{r.status}</Text>
-                  </View>
-                </View>
-                <Text style={styles.recordMeta}>
-                  Format: <Text style={styles.bold}>{r.format}</Text> | Latency:{' '}
-                  <Text style={styles.bold}>{r.latencyMs}ms</Text> | Entries:{' '}
-                  <Text style={styles.bold}>{r.extractedCount}</Text>
-                </Text>
-                <Text style={styles.recordLog}>{r.log}</Text>
-              </View>
-            ))
-          )}
-        </View>
-      </ScrollView>
-      )}
       </View>
 
       {/* Audio Mini-Player (Floating Spotify style) */}
@@ -560,71 +280,96 @@ export default function App(): React.JSX.Element {
         }}
       />
 
-      {/* Modern Bottom Navigation Bar (4 clean tabs) */}
-      <View style={styles.bottomNav}>
+      {/* FIGMA BOTTOM NAVIGATION BAR (4 TABS: Home, Browse, Media, Favourites) */}
+      {(!isBrowserSelectionMode || activeTab !== 'BROWSE') && (
+        <View style={styles.bottomNav}>
+        {/* Home */}
         <TouchableOpacity
           style={styles.navItem}
           onPress={() => setActiveTab('HOME')}
           activeOpacity={0.7}>
-          <View style={[styles.navIconBox, activeTab === 'HOME' && styles.navIconBoxActive]}>
-            <Text style={[styles.navIcon, activeTab === 'HOME' && styles.navIconActive]}>🏠</Text>
+          {activeTab === 'HOME' && <View style={styles.topIndicator} />}
+          <View style={styles.navIconBox}>
+            <HomeOutlineIcon
+              size={22}
+              color={activeTab === 'HOME' ? '#016EEF' : '#64748B'}
+            />
           </View>
           <Text style={[styles.navLabel, activeTab === 'HOME' && styles.navLabelActive]}>
             Home
           </Text>
         </TouchableOpacity>
 
+        {/* Browse */}
         <TouchableOpacity
           style={styles.navItem}
-          onPress={() => setActiveTab('BROWSE')}
+          onPress={() => {
+            setBrowseCategory(undefined);
+            setBrowseShowRecents(false);
+            setActiveTab('BROWSE');
+          }}
           activeOpacity={0.7}>
-          <View style={[styles.navIconBox, activeTab === 'BROWSE' && styles.navIconBoxActive]}>
-            <Text style={[styles.navIcon, activeTab === 'BROWSE' && styles.navIconActive]}>📁</Text>
+          {activeTab === 'BROWSE' && <View style={styles.topIndicator} />}
+          <View style={styles.navIconBox}>
+            <BrowseFolderIcon
+              size={22}
+              color={activeTab === 'BROWSE' ? '#016EEF' : '#64748B'}
+            />
           </View>
           <Text style={[styles.navLabel, activeTab === 'BROWSE' && styles.navLabelActive]}>
-            Files
+            Browse
           </Text>
         </TouchableOpacity>
 
+        {/* Media */}
         <TouchableOpacity
           style={styles.navItem}
-          onPress={() => setActiveTab('STARRED')}
+          onPress={() => setActiveTab('MEDIA')}
           activeOpacity={0.7}>
-          <View style={[styles.navIconBox, activeTab === 'STARRED' && styles.navIconBoxActiveStar]}>
-            <Text style={[styles.navIcon, activeTab === 'STARRED' && styles.navIconActive]}>⭐</Text>
+          {activeTab === 'MEDIA' && <View style={styles.topIndicator} />}
+          <View style={styles.navIconBox}>
+            <MediaPhotosIcon
+              size={22}
+              color={activeTab === 'MEDIA' ? '#016EEF' : '#64748B'}
+            />
           </View>
-          <Text style={[styles.navLabel, activeTab === 'STARRED' && styles.navLabelActiveStar]}>
-            Starred
+          <Text style={[styles.navLabel, activeTab === 'MEDIA' && styles.navLabelActive]}>
+            Media
           </Text>
         </TouchableOpacity>
 
+        {/* Favourites */}
         <TouchableOpacity
           style={styles.navItem}
-          onPress={() => setActiveTab('ARCHIVE')}
+          onPress={() => setActiveTab('FAVOURITES')}
           activeOpacity={0.7}>
-          <View style={[styles.navIconBox, activeTab === 'ARCHIVE' && styles.navIconBoxActive]}>
-            <Text style={[styles.navIcon, activeTab === 'ARCHIVE' && styles.navIconActive]}>📦</Text>
+          {activeTab === 'FAVOURITES' && <View style={styles.topIndicator} />}
+          <View style={styles.navIconBox}>
+            <StarOutlineIcon
+              size={22}
+              color={activeTab === 'FAVOURITES' ? '#016EEF' : '#64748B'}
+            />
           </View>
-          <Text style={[styles.navLabel, activeTab === 'ARCHIVE' && styles.navLabelActive]}>
-            Archive
+          <Text style={[styles.navLabel, activeTab === 'FAVOURITES' && styles.navLabelActive]}>
+            Favourites
           </Text>
         </TouchableOpacity>
       </View>
+      )}
 
       {/* Archive Viewer Modal */}
       <Modal
         visible={viewingArchive !== null}
         animationType="slide"
-        statusBarTranslucent={true}
+        statusBarTranslucent={false}
         onRequestClose={() => setViewingArchive(null)}>
         {viewingArchive && (
           <View
             style={{
               flex: 1,
               backgroundColor: '#1e293b',
-              paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 0,
             }}>
-            <StatusBar barStyle="light-content" backgroundColor="#1e293b" translucent={true} />
+            <StatusBar hidden={true} />
             {viewingArchive.isRar ? (
               <RarViewerScreen
                 filePath={viewingArchive.path}
@@ -646,7 +391,7 @@ export default function App(): React.JSX.Element {
       <Modal
         visible={activeAudioModal !== null}
         animationType="slide"
-        statusBarTranslucent={true}
+        statusBarTranslucent={false}
         onRequestClose={() => setActiveAudioModal(null)}>
         {activeAudioModal && (
           <MediaViewer
@@ -662,16 +407,15 @@ export default function App(): React.JSX.Element {
       <Modal
         visible={externalViewer !== null}
         animationType="slide"
-        statusBarTranslucent={true}
+        statusBarTranslucent={false}
         onRequestClose={() => setExternalViewer(null)}>
         {externalViewer && (
           <View
             style={{
               flex: 1,
-              backgroundColor: '#0f172a',
-              paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 0,
+              backgroundColor: '#0F172A',
             }}>
-            <StatusBar barStyle="light-content" backgroundColor="#0f172a" translucent={true} />
+            <StatusBar hidden={true} />
             {externalViewer.category === 'PDF' && (
               <PdfViewer
                 filePath={externalViewer.path}
@@ -690,8 +434,7 @@ export default function App(): React.JSX.Element {
                 onClose={() => setExternalViewer(null)}
               />
             )}
-            {(externalViewer.category === 'OFFICE_XLSX' ||
-              externalViewer.category === 'LEGACY_OLE_XLS') && (
+            {externalViewer.category === 'OFFICE_XLSX' && (
               <XlsxViewer
                 filePath={externalViewer.path}
                 fileName={externalViewer.file}
@@ -705,18 +448,10 @@ export default function App(): React.JSX.Element {
                 onClose={() => setExternalViewer(null)}
               />
             )}
-            {externalViewer.category === 'IMAGE' && (
-              <ImageViewer
+            {externalViewer.category === 'ARCHIVE_RAR' && (
+              <RarViewerScreen
                 filePath={externalViewer.path}
                 fileName={externalViewer.file}
-                onClose={() => setExternalViewer(null)}
-              />
-            )}
-            {(externalViewer.category === 'AUDIO' || externalViewer.category === 'VIDEO') && (
-              <MediaViewer
-                filePath={externalViewer.path}
-                fileName={externalViewer.file}
-                category={externalViewer.category as any}
                 onClose={() => setExternalViewer(null)}
               />
             )}
@@ -727,15 +462,30 @@ export default function App(): React.JSX.Element {
                 onClose={() => setExternalViewer(null)}
               />
             )}
-            {externalViewer.category === 'ARCHIVE_RAR' && (
-              <RarViewerScreen
+            {externalViewer.category === 'IMAGE' && (
+              <ImageViewer
                 filePath={externalViewer.path}
                 fileName={externalViewer.file}
                 onClose={() => setExternalViewer(null)}
               />
             )}
+            {(externalViewer.category === 'VIDEO' || externalViewer.category === 'AUDIO') && (
+              <MediaViewer
+                filePath={externalViewer.path}
+                fileName={externalViewer.file}
+                category={externalViewer.category as 'VIDEO' | 'AUDIO'}
+                onClose={() => setExternalViewer(null)}
+              />
+            )}
             {externalViewer.category === 'TEXT_CODE' && (
               <TextViewer
+                filePath={externalViewer.path}
+                fileName={externalViewer.file}
+                onClose={() => setExternalViewer(null)}
+              />
+            )}
+            {externalViewer.category === 'UNSUPPORTED' && (
+              <UnsupportedFileScreen
                 filePath={externalViewer.path}
                 fileName={externalViewer.file}
                 onClose={() => setExternalViewer(null)}
@@ -751,248 +501,62 @@ export default function App(): React.JSX.Element {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8f9fa',
-    paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 0,
+    backgroundColor: FigmaTheme.colors.background,
   },
-  header: {
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 10,
-    backgroundColor: '#ffffff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
-  },
-  title: {fontSize: 18, fontWeight: '800', color: '#1a73e8'},
-  headerTitleRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  offlinePill: {
-    backgroundColor: '#e6f4ea',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#ceead6',
-  },
-  offlinePillText: {
-    color: '#137333',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  subtitle: {fontSize: 11, color: '#5f6368', marginTop: 2},
   body: {
     flex: 1,
   },
   bottomNav: {
     flexDirection: 'row',
-    height: 62,
-    backgroundColor: '#ffffff',
+    height: 60,
+    backgroundColor: '#FFFFFF',
     borderTopWidth: 1,
-    borderTopColor: '#f1f5f9',
+    borderTopColor: FigmaTheme.colors.cardBorder,
     alignItems: 'center',
     justifyContent: 'space-around',
-    elevation: 8,
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: -2 },
+    ...FigmaTheme.shadows.card,
   },
   navItem: {
     flex: 1,
+    height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 4,
+    position: 'relative',
+  },
+  topIndicator: {
+    position: 'absolute',
+    top: 0,
+    width: 28,
+    height: 3,
+    backgroundColor: FigmaTheme.colors.primary,
+    borderBottomLeftRadius: 3,
+    borderBottomRightRadius: 3,
   },
   navIconBox: {
-    paddingHorizontal: 14,
-    paddingVertical: 3,
-    borderRadius: 14,
-  },
-  navIconBoxActive: {
-    backgroundColor: '#eff6ff',
-  },
-  navIconBoxActiveStar: {
-    backgroundColor: '#fef3c7',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   navIcon: {
     fontSize: 20,
-    opacity: 0.7,
+    opacity: 0.5,
+    color: FigmaTheme.colors.textSecondary,
   },
   navIconActive: {
     opacity: 1,
+    color: FigmaTheme.colors.primary,
+  },
+  navIconActiveStar: {
+    opacity: 1,
+    color: '#7C3AED',
   },
   navLabel: {
     fontSize: 11,
-    fontWeight: '500',
-    color: '#64748b',
+    fontWeight: '600',
+    color: FigmaTheme.colors.textSecondary,
     marginTop: 2,
   },
   navLabelActive: {
-    color: '#2563eb',
+    color: FigmaTheme.colors.primary,
     fontWeight: '700',
   },
-  navLabelActiveStar: {
-    color: '#d97706',
-    fontWeight: '700',
-  },
-  badgeRow: {flexDirection: 'row', marginTop: 8, gap: 8},
-  badge: {
-    backgroundColor: '#e6f4ea',
-    paddingHorizontal: 10,
-    paddingVertical: 3,
-    borderRadius: 6,
-  },
-  badgeText: {fontSize: 11, fontWeight: '700', color: '#137333'},
-  content: {padding: 16},
-  activeCard: {
-    backgroundColor: '#e8f0fe',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 16,
-    borderWidth: 1.5,
-    borderColor: '#1a73e8',
-  },
-  activeHeader: {flexDirection: 'row', alignItems: 'center', gap: 8},
-  activeTitle: {fontSize: 15, fontWeight: '700', color: '#1a73e8'},
-  activeMsg: {fontSize: 13, color: '#202124', marginTop: 6},
-  cancelButton: {
-    marginTop: 10,
-    backgroundColor: '#d93025',
-    paddingVertical: 8,
-    borderRadius: 6,
-    alignItems: 'center',
-  },
-  cancelButtonText: {color: '#ffffff', fontWeight: '700', fontSize: 12},
-
-  card: {
-    backgroundColor: '#ffffff',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  cardTitle: {fontSize: 15, fontWeight: '700', color: '#202124'},
-  cardDesc: {fontSize: 12, color: '#5f6368', marginTop: 4, marginBottom: 12},
-  pickButton: {
-    backgroundColor: '#e8f0fe',
-    borderWidth: 1.5,
-    borderColor: '#1a73e8',
-    borderStyle: 'dashed',
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  pickButtonText: {color: '#1a73e8', fontWeight: '700', fontSize: 13},
-  pickedFileBox: {
-    backgroundColor: '#f1f3f4',
-    padding: 10,
-    borderRadius: 6,
-    marginTop: 10,
-  },
-  pickedFileName: {fontSize: 13, fontWeight: '700', color: '#202124'},
-  pickedFileSize: {fontSize: 11, color: '#5f6368', marginTop: 2},
-  passwordRow: {marginTop: 12},
-  inputLabel: {fontSize: 12, fontWeight: '600', color: '#3c4043', marginBottom: 4},
-  passwordInput: {
-    backgroundColor: '#f8f9fa',
-    borderWidth: 1,
-    borderColor: '#dadce0',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    fontSize: 14,
-    color: '#202124',
-  },
-  primaryButton: {
-    backgroundColor: '#1a73e8',
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 12,
-  },
-  primaryButtonText: {color: '#ffffff', fontWeight: '700', fontSize: 13},
-  disabledButton: {opacity: 0.5},
-
-  folderHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-  },
-  folderTip: {fontSize: 11, color: '#5f6368', marginTop: 3},
-  refreshButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#1a73e8',
-  },
-  refreshButtonText: {color: '#1a73e8', fontWeight: '600', fontSize: 12},
-  testAllBtn: {
-    backgroundColor: '#34a853',
-    paddingVertical: 10,
-    borderRadius: 6,
-    alignItems: 'center',
-    marginVertical: 10,
-  },
-  testAllBtnText: {color: '#ffffff', fontWeight: '700', fontSize: 12},
-  fileList: {marginTop: 6},
-  fileRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f1f3f4',
-  },
-  fileInfo: {flex: 1, marginRight: 8},
-  fileNameText: {fontSize: 13, fontWeight: '700', color: '#202124'},
-  fileSizeText: {fontSize: 11, color: '#5f6368', marginTop: 2},
-  testSingleBtn: {
-    backgroundColor: '#1a73e8',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  testSingleBtnText: {color: '#ffffff', fontWeight: '700', fontSize: 12},
-  emptyBox: {paddingVertical: 20, alignItems: 'center'},
-  emptyFolderText: {fontSize: 13, color: '#5f6368', fontWeight: '600'},
-  emptyFolderSubText: {fontSize: 11, color: '#80868b', marginTop: 4, textAlign: 'center'},
-
-  tableHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  clearText: {fontSize: 12, color: '#d93025', fontWeight: '600'},
-  emptyText: {color: '#80868b', fontSize: 12, marginTop: 10, textAlign: 'center'},
-  recordRow: {
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f1f3f4',
-  },
-  recordHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  fileName: {fontSize: 13, fontWeight: '700', color: '#202124'},
-  statusBadge: {paddingHorizontal: 8, paddingVertical: 3, borderRadius: 4},
-  passBadge: {backgroundColor: '#e6f4ea'},
-  blockedBadge: {backgroundColor: '#fce8e6'},
-  errorBadge: {backgroundColor: '#fef7e0'},
-  statusBadgeText: {fontSize: 11, fontWeight: '700', color: '#202124'},
-  recordMeta: {fontSize: 11, color: '#5f6368', marginTop: 4},
-  recordLog: {
-    fontSize: 11,
-    color: '#3c4043',
-    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier',
-    marginTop: 4,
-    backgroundColor: '#f8f9fa',
-    padding: 6,
-    borderRadius: 4,
-  },
-  bold: {fontWeight: '700', color: '#202124'},
 });

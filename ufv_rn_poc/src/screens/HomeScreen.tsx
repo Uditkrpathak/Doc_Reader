@@ -6,17 +6,46 @@ import {
   ScrollView,
   TextInput,
   StyleSheet,
-  ActivityIndicator,
   Modal,
-  Platform,
   StatusBar,
+  AppState,
 } from 'react-native';
-import { MMKV, RecentFile } from '../services/MMKV';
+import { MMKV, RecentFile, LastPosition } from '../services/MMKV';
 import { ArchiveEngine } from '../services/ArchiveEngine';
 import { FileDetector } from '../services/FileDetector';
-import { FileDetailsModal, FileDetailsItem } from '../components/FileDetailsModal';
 import { StorageService, DashboardCounts, StorageUsage } from '../services/StorageService';
 import { usePermissions } from '../hooks/usePermissions';
+import { WalletService } from '../services/WalletService';
+import { AdService, SponsorCard } from '../services/AdService';
+import { FigmaTheme } from '../theme/FigmaTheme';
+
+// Figma Modals & Components
+import { FileActionMenuModal, ActionMenuItemFile } from '../components/FileActionMenuModal';
+import { FileInformationModal, FileInfoData } from '../components/FileInformationModal';
+import { WalletModal } from '../components/WalletModal';
+import { SettingsScreen } from './SettingsScreen';
+import { RewardsScreen } from './RewardsScreen';
+import { PremiumPaywallScreen } from './PremiumPaywallScreen';
+import { AuthScreen, AuthMode } from './AuthScreen';
+import {
+  FolderOutlineIcon,
+  CoinIcon,
+  SettingsGearIcon,
+  DocumentFileBadgeIcon,
+  SearchOutlineIcon,
+  CategoryDocIcon,
+  CategorySheetIcon,
+  CategoryImgIcon,
+  CategoryArchiveIcon,
+  HardDriveStorageIcon,
+  DocScannerIcon,
+  EmptyDocOutlineIcon,
+  RightArrowIcon,
+} from '../components/AppIcons';
+
+// Strict State Machine
+import { useFileOpeningStateMachine } from '../hooks/useFileOpeningStateMachine';
+import { FileOpeningStateView } from '../components/FileOpeningStateView';
 
 // Viewers
 import { PdfViewer } from '../viewers/PdfViewer';
@@ -28,6 +57,7 @@ import { RarViewerScreen } from './RarViewerScreen';
 import { ZipViewerScreen } from './ZipViewerScreen';
 import { XlsxViewer } from './XlsxViewer';
 import { CsvViewer } from './CsvViewer';
+import { UnsupportedFileScreen } from './UnsupportedFileScreen';
 
 interface HomeScreenProps {
   navigation?: {
@@ -36,122 +66,55 @@ interface HomeScreenProps {
   initialCategory?: string;
 }
 
-interface CategoryItem {
-  id: string;
-  name: string;
-  badgeLabel: string;
-  badgeColor: string;
-  badgeTextColor: string;
-  isBadgeIcon?: boolean;
-  countKey: keyof DashboardCounts;
-  extensions: string[];
-}
-
-const CATEGORIES: CategoryItem[] = [
-  {
-    id: 'PDF',
-    name: 'PDF',
-    badgeLabel: 'PDF',
-    badgeColor: '#ef4444',
-    badgeTextColor: '#ffffff',
-    countKey: 'pdf',
-    extensions: ['pdf'],
-  },
-  {
-    id: 'WORD',
-    name: 'Word',
-    badgeLabel: 'W',
-    badgeColor: '#2563eb',
-    badgeTextColor: '#ffffff',
-    countKey: 'word',
-    extensions: ['docx', 'doc', 'txt', 'rtf'],
-  },
-  {
-    id: 'EXCEL',
-    name: 'Excel',
-    badgeLabel: 'X',
-    badgeColor: '#10b981',
-    badgeTextColor: '#ffffff',
-    countKey: 'excel',
-    extensions: ['xlsx', 'xls', 'csv', 'tsv'],
-  },
-  {
-    id: 'PPT',
-    name: 'PowerPoint',
-    badgeLabel: 'P',
-    badgeColor: '#f97316',
-    badgeTextColor: '#ffffff',
-    countKey: 'pptx',
-    extensions: ['pptx', 'ppt'],
-  },
-  {
-    id: 'ARCHIVE',
-    name: 'ZIP • RAR',
-    badgeLabel: 'ZIP',
-    badgeColor: '#8b5cf6',
-    badgeTextColor: '#ffffff',
-    countKey: 'archive',
-    extensions: ['zip', 'rar', '7z', 'tar', 'gz'],
-  },
-  {
-    id: 'AUDIO',
-    name: 'Audio',
-    badgeLabel: '🎵',
-    badgeColor: '#a855f7',
-    badgeTextColor: '#ffffff',
-    isBadgeIcon: true,
-    countKey: 'audio',
-    extensions: ['mp3', 'wav', 'aac', 'flac', 'ogg', 'm4a'],
-  },
-  {
-    id: 'VIDEO',
-    name: 'Video',
-    badgeLabel: '▶',
-    badgeColor: '#f43f5e',
-    badgeTextColor: '#ffffff',
-    isBadgeIcon: true,
-    countKey: 'video',
-    extensions: ['mp4', 'mkv', 'avi', 'mov', 'webm'],
-  },
-  {
-    id: 'IMAGE',
-    name: 'Images',
-    badgeLabel: '🖼️',
-    badgeColor: '#14b8a6',
-    badgeTextColor: '#ffffff',
-    isBadgeIcon: true,
-    countKey: 'image',
-    extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif', 'avif'],
-  },
-];
-
-export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCategory }) => {
-  const { permissionState, requestMediaPermissions, requestDocumentsTree } = usePermissions();
+export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCategory: _initialCategory }) => {
+  const {
+    permissionState,
+    requestAllFilesAccess,
+    refreshPermissions,
+  } = usePermissions();
 
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
-  const [starredFiles, setStarredFiles] = useState<RecentFile[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState<string>(initialCategory || 'ALL');
+  const [continueFiles, setContinueFiles] = useState<Array<RecentFile & { pos: LastPosition }>>([]);
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [isSearchVisible, setIsSearchVisible] = useState<boolean>(false);
-  const [continueFiles, setContinueFiles] = useState<Array<RecentFile & { pos: any }>>([]);
 
-  // Storage Dashboard
-  const [dashboardCounts, setDashboardCounts] = useState<DashboardCounts | null>(() =>
+  const displayedRecentFiles = useMemo(() => {
+    const q = searchQuery.toLowerCase().trim();
+    if (!q) return recentFiles;
+    return recentFiles.filter((f) => f.name.toLowerCase().includes(q));
+  }, [recentFiles, searchQuery]);
+
+  // Populated state only when user actually has opened files (Zero mock data on initial start)
+  const isPopulated = displayedRecentFiles.length > 0;
+  const effectiveRecentFiles = displayedRecentFiles;
+  const effectiveContinueFile = continueFiles.length > 0 ? continueFiles[0] : null;
+
+  const walletService = WalletService.getInstance();
+  const adService = AdService.getInstance();
+
+  const [isWalletVisible, setIsWalletVisible] = useState<boolean>(false);
+  const [isSettingsVisible, setIsSettingsVisible] = useState<boolean>(false);
+  const [isRewardsVisible, setIsRewardsVisible] = useState<boolean>(false);
+  const [isPaywallVisible, setIsPaywallVisible] = useState<boolean>(false);
+  const [authModalState, setAuthModalState] = useState<{ visible: boolean; mode?: AuthMode }>({
+    visible: false,
+  });
+  const [walletBalance, setWalletBalance] = useState<number>(() => walletService.getBalance());
+  const [isAdFreeActive, setIsAdFreeActive] = useState<boolean>(() => walletService.isAdFreeActive());
+  const [sponsorCard, setSponsorCard] = useState<SponsorCard | null>(() =>
+    adService.getRandomSponsorCard()
+  );
+
+  // Storage data
+  const [_dashboardCounts, setDashboardCounts] = useState<DashboardCounts | null>(() =>
     StorageService.getInstance().getCachedDashboardCounts()
   );
   const [storageUsage, setStorageUsage] = useState<StorageUsage | null>(null);
-  const [isScanningDashboard, setIsScanningDashboard] = useState<boolean>(false);
 
-  // Modals & Details
-  const [selectedDetailFile, setSelectedDetailFile] = useState<FileDetailsItem | null>(null);
-  const [categoryFiles, setCategoryFiles] = useState<any[]>([]);
-  const [isLoadingCategoryFiles, setIsLoadingCategoryFiles] = useState<boolean>(false);
-  const [isPermissionBannerDismissed, setIsPermissionBannerDismissed] = useState<boolean>(false);
-  const [isCleanModalVisible, setIsCleanModalVisible] = useState<boolean>(false);
-  const [cleanedAmount, setCleanedAmount] = useState<string>('');
-  const [isCleaning, setIsCleaning] = useState<boolean>(false);
+  // Action Menu & Info Modals
+  const [actionMenuFile, setActionMenuFile] = useState<ActionMenuItemFile | null>(null);
+  const [infoModalFile, setInfoModalFile] = useState<FileInfoData | null>(null);
 
-  // Active viewer modal
+  // Active file viewer
   const [activeViewer, setActiveViewer] = useState<{
     file: string;
     path: string;
@@ -161,6 +124,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
 
   const engine = ArchiveEngine.getInstance();
   const storageService = StorageService.getInstance();
+
+  // Strict state machine
+  const stateMachine = useFileOpeningStateMachine();
 
   const formatBytes = (bytes?: number): string => {
     if (!bytes || bytes <= 0) return '0 B';
@@ -176,69 +142,37 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     const diffSec = Math.floor((now - timestamp) / 1000);
     if (diffSec < 60) return 'Just now';
     const diffMin = Math.floor(diffSec / 60);
-    if (diffMin < 60) return `${diffMin} min ago`;
+    if (diffMin < 60) return `${diffMin}m ago`;
     const diffHours = Math.floor(diffMin / 60);
-    if (diffHours < 24) return `${diffHours} ${diffHours === 1 ? 'hour' : 'hours'} ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
     const diffDays = Math.floor(diffHours / 24);
     if (diffDays === 1) return 'Yesterday';
-    if (diffDays < 7) return `${diffDays} days ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
     return new Date(timestamp).toLocaleDateString();
   };
 
-  const getBadgeForFile = (category?: string, fileName?: string) => {
-    const ext = (fileName?.split('.').pop() || '').toLowerCase();
-    if (category === 'PDF' || ext === 'pdf') {
-      return { label: 'PDF', bg: '#ef4444', isIcon: false };
-    }
-    if (
-      category === 'OFFICE_DOCX' ||
-      category === 'LEGACY_OLE_DOC' ||
-      ['docx', 'doc', 'txt', 'rtf'].includes(ext)
-    ) {
-      return { label: 'W', bg: '#2563eb', isIcon: false };
-    }
-    if (
-      category === 'OFFICE_XLSX' ||
-      category === 'LEGACY_OLE_XLS' ||
-      category === 'SPREADSHEET_CSV' ||
-      ['xlsx', 'xls', 'csv', 'tsv'].includes(ext)
-    ) {
-      return { label: 'X', bg: '#10b981', isIcon: false };
-    }
-    if (
-      category === 'OFFICE_PPTX' ||
-      category === 'LEGACY_OLE_PPT' ||
-      ['pptx', 'ppt'].includes(ext)
-    ) {
-      return { label: 'P', bg: '#f97316', isIcon: false };
-    }
-    if (
-      category === 'ARCHIVE_ZIP' ||
-      category === 'ARCHIVE_RAR' ||
-      ['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)
-    ) {
-      return { label: 'ZIP', bg: '#8b5cf6', isIcon: false };
-    }
-    if (category === 'AUDIO' || ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'].includes(ext)) {
-      return { label: '🎵', bg: '#a855f7', isIcon: true };
-    }
-    if (category === 'VIDEO' || ['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) {
-      return { label: '▶', bg: '#f43f5e', isIcon: true };
-    }
-    if (category === 'IMAGE' || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic'].includes(ext)) {
-      return { label: '🖼️', bg: '#14b8a6', isIcon: true };
-    }
-    return { label: 'DOC', bg: '#64748b', isIcon: false };
+  const getBadgeForFile = (fileName: string) => {
+    const ext = (fileName.split('.').pop() || '').toLowerCase();
+    if (ext === 'pdf') return FigmaTheme.badges.pdf;
+    if (['xlsx', 'xls', 'csv'].includes(ext)) return FigmaTheme.badges.excel;
+    if (['docx', 'doc', 'txt', 'rtf'].includes(ext)) return FigmaTheme.badges.word;
+    if (['pptx', 'ppt'].includes(ext)) return FigmaTheme.badges.pptx;
+    if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return FigmaTheme.badges.archive;
+    if (['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) return FigmaTheme.badges.video;
+    if (['mp3', 'wav', 'm4a', 'aac', 'flac'].includes(ext)) return FigmaTheme.badges.audio;
+    if (['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) return FigmaTheme.badges.image;
+    return FigmaTheme.badges.unknown;
   };
 
   const loadData = useCallback(() => {
-    setRecentFiles(MMKV.getRecentFiles());
-    setStarredFiles(MMKV.getStarredFiles());
-    setContinueFiles(MMKV.getContinueReadingFiles());
+    // Zero mock data: only real files stored when opened on device
+    const recents = MMKV.getRecentFiles();
+    const cont = MMKV.getContinueReadingFiles();
+    setRecentFiles(recents);
+    setContinueFiles(cont);
   }, []);
 
   const loadStorageData = useCallback(async () => {
-    setIsScanningDashboard(true);
     try {
       const [counts, usage] = await Promise.all([
         storageService.getStorageDashboardCounts(),
@@ -248,8 +182,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
       setStorageUsage(usage);
     } catch (err) {
       console.warn('loadStorageData error', err);
-    } finally {
-      setIsScanningDashboard(false);
     }
   }, [storageService]);
 
@@ -258,97 +190,34 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     loadStorageData();
   }, [loadData, loadStorageData]);
 
-  // When a specific category is selected, query device files
+  // Handle app coming to foreground
   useEffect(() => {
-    if (selectedCategory !== 'ALL' && selectedCategory !== 'STARRED') {
-      setIsLoadingCategoryFiles(true);
-      storageService
-        .queryCategoryFiles(selectedCategory, 0, 100)
-        .then((files) => {
-          setCategoryFiles(files);
-        })
-        .catch((err) => {
-          console.warn('queryCategoryFiles error', err);
-          setCategoryFiles([]);
-        })
-        .finally(() => {
-          setIsLoadingCategoryFiles(false);
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState === 'active') {
+        refreshPermissions().then(() => {
+          loadStorageData();
         });
-    } else {
-      setCategoryFiles([]);
-    }
-  }, [selectedCategory, storageService]);
-
-  const handleRecentTap = async (recent: RecentFile) => {
-    try {
-      let targetPath = recent.path;
-      if (targetPath.startsWith('content://')) {
-        const resolved = await storageService.resolveToLocalFile(targetPath);
-        targetPath = resolved.localPath;
       }
-      const detected = await FileDetector.detectFile(targetPath, recent.name);
-      MMKV.addRecentFile({
-        ...recent,
-        path: targetPath,
-        timestamp: Date.now(),
-        category: detected.category,
-      });
-      loadData();
-      openMatchingViewer(recent.name, targetPath, detected.category);
-    } catch {
-      openMatchingViewer(recent.name, recent.path, recent.category || 'UNKNOWN');
-    }
-  };
-
-  const handleToggleStar = (file: { name: string; path: string; size?: number; category?: string }) => {
-    MMKV.toggleStarred({
-      name: file.name,
-      path: file.path,
-      size: file.size || 0,
-      timestamp: Date.now(),
-      category: file.category || 'UNKNOWN',
     });
-    loadData();
-  };
+    return () => {
+      subscription.remove();
+    };
+  }, [refreshPermissions, loadStorageData]);
 
-  const handleClearRecents = () => {
-    MMKV.clearRecentFiles();
-    loadData();
-  };
-
-  const handleCleanUpStorage = async () => {
-    setIsCleaning(true);
-    try {
-      const res = await engine.cleanTemporaryCache();
-      const freed = res.freedBytes;
-      if (freed > 0) {
-        setCleanedAmount(`Freed ${formatBytes(freed)} of temporary files`);
-      } else {
-        setCleanedAmount('Cache is already clean and optimal (0 B)');
-      }
-      setIsCleanModalVisible(true);
-      loadStorageData();
-    } catch {
-      setCleanedAmount('Cache optimized');
-      setIsCleanModalVisible(true);
-    } finally {
-      setIsCleaning(false);
-    }
-  };
 
   const openMatchingViewer = (fileName: string, filePath: string, category: string) => {
     let formatType = undefined;
     const ext = fileName.split('.').pop()?.toLowerCase() || '';
 
-    if (ext === 'rar' || category === 'ARCHIVE_RAR') {
+    if (ext === 'rar' || category === 'ARCHIVE_RAR' || category === 'ARCHIVE_RAR4' || category === 'ARCHIVE_RAR5') {
       setActiveViewer({ file: fileName, path: filePath, category: 'ARCHIVE_RAR' });
       return;
     }
-    if (ext === 'zip' || category === 'ARCHIVE_ZIP') {
+    if (ext === 'zip' || category === 'ARCHIVE_ZIP' || category === 'ARCHIVE') {
       setActiveViewer({ file: fileName, path: filePath, category: 'ARCHIVE_ZIP' });
       return;
     }
-    if (ext === 'xlsx' || ext === 'xls' || category === 'OFFICE_XLSX') {
+    if (ext === 'xlsx' || ext === 'xls' || category === 'OFFICE_XLSX' || category === 'EXCEL' || category === 'LEGACY_OLE_XLS') {
       setActiveViewer({ file: fileName, path: filePath, category: 'OFFICE_XLSX' });
       return;
     }
@@ -364,10 +233,19 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
       return;
     }
 
-    if (ext === 'docx' || category === 'OFFICE_DOCX') {
+    if (['mp4', 'mkv', 'webm', 'avi', 'mov', '3gp'].includes(ext) || category === 'VIDEO') {
+      setActiveViewer({ file: fileName, path: filePath, category: 'VIDEO' });
+      return;
+    }
+    if (['mp3', 'wav', 'aac', 'ogg', 'flac', 'm4a'].includes(ext) || category === 'AUDIO') {
+      setActiveViewer({ file: fileName, path: filePath, category: 'AUDIO' });
+      return;
+    }
+
+    if (ext === 'docx' || category === 'OFFICE_DOCX' || category === 'WORD') {
       formatType = 'DOCX';
       category = 'OFFICE_DOCX';
-    } else if (ext === 'pptx' || category === 'OFFICE_PPTX') {
+    } else if (ext === 'pptx' || category === 'OFFICE_PPTX' || category === 'PPT') {
       formatType = 'PPTX';
       category = 'OFFICE_PPTX';
     } else if (ext === 'doc' || category === 'LEGACY_OLE_DOC') {
@@ -378,6 +256,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
       category = 'LEGACY_OLE_PPT';
     } else if (ext === 'pdf' || category === 'PDF') {
       category = 'PDF';
+    } else if (
+      [
+        'txt', 'log', 'json', 'xml', 'md', 'html', 'htm', 'css', 'js', 'jsx',
+        'ts', 'tsx', 'java', 'kt', 'py', 'c', 'cpp', 'h', 'cs', 'sh',
+        'sql', 'yaml', 'yml', 'env', 'ini', 'conf', 'gradle', 'properties',
+      ].includes(ext) ||
+      category === 'TEXT_CODE'
+    ) {
+      category = 'TEXT_CODE';
+    } else {
+      category = 'UNSUPPORTED';
     }
 
     setActiveViewer({
@@ -388,1124 +277,1453 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation, initialCateg
     });
   };
 
-  // Files to display in Recent/Category section
-  const displayedFiles = useMemo(() => {
-    let baseList: RecentFile[] = selectedCategory === 'STARRED' ? starredFiles : recentFiles;
-
-    if (selectedCategory !== 'ALL' && selectedCategory !== 'STARRED') {
-      if (categoryFiles.length > 0) {
-        baseList = categoryFiles.map((cf) => ({
-          name: cf.name,
-          path: cf.uri,
-          size: cf.size,
-          timestamp: cf.modified,
-          category: cf.category,
-          mimeType: cf.mime,
-        }));
-      } else {
-        const cat = CATEGORIES.find((c) => c.id === selectedCategory);
-        if (cat) {
-          baseList = recentFiles.filter((f) => {
-            const ext = (f.name.split('.').pop() || '').toLowerCase();
-            return cat.extensions.includes(ext);
-          });
-        }
+  const handleOpenFile = async (file: { name: string; path: string; size?: number }) => {
+    try {
+      let targetPath = file.path;
+      if (targetPath.startsWith('content://')) {
+        const resolved = await storageService.resolveToLocalFile(targetPath);
+        targetPath = resolved.localPath;
       }
+      const detected = await FileDetector.detectFile(targetPath, file.name);
+      MMKV.addRecentFile({
+        name: file.name,
+        path: targetPath,
+        size: file.size || 0,
+        timestamp: Date.now(),
+        category: detected.category,
+      });
+      loadData();
+      openMatchingViewer(file.name, targetPath, detected.category);
+    } catch {
+      openMatchingViewer(file.name, file.path, 'UNKNOWN');
     }
+  };
 
-    if (searchQuery.trim().length > 0) {
-      const q = searchQuery.toLowerCase().trim();
-      baseList = baseList.filter((f) => f.name.toLowerCase().includes(q));
+  const handlePickAnyFile = async () => {
+    try {
+      const res = await engine.pickFile();
+      await handleOpenFile(res);
+    } catch (err) {
+      console.warn('Pick file cancelled or failed', err);
     }
+  };
 
-    return baseList;
-  }, [recentFiles, starredFiles, selectedCategory, searchQuery, categoryFiles]);
+  const handleShareFile = async (file: ActionMenuItemFile | FileInfoData) => {
+    try {
+      await engine.shareFile(file.path);
+    } catch (err) {
+      console.warn('Share file failed', err);
+    }
+  };
 
-  // Real storage numbers from device (zero mock data)
-  const usedGB = storageUsage && storageUsage.totalBytes > 0
-    ? (storageUsage.usedBytes / (1024 * 1024 * 1024)).toFixed(0)
-    : '0';
-  const totalGB = storageUsage && storageUsage.totalBytes > 0
-    ? (storageUsage.totalBytes / (1024 * 1024 * 1024)).toFixed(0)
-    : '0';
-  const freeGB = storageUsage && storageUsage.totalBytes > 0
-    ? (storageUsage.freeBytes / (1024 * 1024 * 1024)).toFixed(0)
-    : '0';
-  const progressPercent = storageUsage && storageUsage.totalBytes > 0
-    ? Math.min(100, Math.round((storageUsage.usedBytes / storageUsage.totalBytes) * 100))
+  const handleToggleStar = (file: ActionMenuItemFile) => {
+    MMKV.toggleStarred({
+      name: file.name,
+      path: file.path,
+      size: file.size || 0,
+      timestamp: Date.now(),
+      category: file.category || 'UNKNOWN',
+    });
+    loadData();
+  };
+
+  const handleRemoveRecent = (file: ActionMenuItemFile) => {
+    MMKV.removeRecentFile(file.path);
+    loadData();
+  };
+
+  // Real StatFs Storage Numbers (Zero Mock Data)
+  const totalGb = storageUsage ? (storageUsage.totalBytes / (1024 * 1024 * 1024)).toFixed(1) : null;
+  const usedGb = storageUsage ? (storageUsage.usedBytes / (1024 * 1024 * 1024)).toFixed(1) : null;
+
+  // Real Category Breakdown (Zero Mock Data)
+  const mediaBytes = _dashboardCounts
+    ? (_dashboardCounts.image?.totalBytes || 0) +
+    (_dashboardCounts.video?.totalBytes || 0) +
+    (_dashboardCounts.audio?.totalBytes || 0)
     : 0;
 
+  const docsBytes = _dashboardCounts
+    ? (_dashboardCounts.pdf?.totalBytes || 0) +
+    (_dashboardCounts.word?.totalBytes || 0) +
+    (_dashboardCounts.excel?.totalBytes || 0) +
+    (_dashboardCounts.pptx?.totalBytes || 0) +
+    (_dashboardCounts.archive?.totalBytes || 0)
+    : 0;
+
+  const totalUsedBytes = storageUsage?.usedBytes || 0;
+  const totalCapacityBytes = storageUsage?.totalBytes || (totalUsedBytes > 0 ? totalUsedBytes : 1);
+  const otherBytes = Math.max(0, totalUsedBytes - (mediaBytes + docsBytes));
+  const freeBytes = storageUsage?.freeBytes || 0;
+
+  const mediaFlex = Math.max(0.005, mediaBytes / totalCapacityBytes);
+  const docsFlex = Math.max(0.005, docsBytes / totalCapacityBytes);
+  const otherFlex = Math.max(0.005, otherBytes / totalCapacityBytes);
+  const freeFlex = Math.max(0.01, freeBytes / totalCapacityBytes);
+
+  const mediaGbText = formatBytes(mediaBytes);
+  const docsGbText = formatBytes(docsBytes);
+  const othersGbText = formatBytes(otherBytes);
+
+  // Permission-aware navigation handlers
+  const handleHeroBrowse = () => {
+    if (navigation?.navigate) {
+      navigation.navigate('Browse');
+    } else {
+      handlePickAnyFile();
+    }
+  };
+
+  const handleBrowseDeviceFiles = async () => {
+    if (navigation?.navigate) {
+      if (permissionState.allFiles || permissionState.documentsTreeGranted) {
+        navigation.navigate('Browse');
+        return;
+      }
+      await requestAllFilesAccess();
+      navigation.navigate('Browse');
+    } else {
+      await handlePickAnyFile();
+    }
+  };
+
+  const handleCategoryPress = (category: string) => {
+    navigation?.navigate('Browse', { category });
+  };
+
   return (
-    <ScrollView
-      style={styles.container}
-      contentContainerStyle={styles.content}
-      showsVerticalScrollIndicator={false}>
-      <StatusBar barStyle="dark-content" backgroundColor="#f8fafc" />
+    <View style={styles.container}>
+      <StatusBar hidden={true} />
 
-      {/* 1. Header Bar: App Title + Search & Profile Avatar */}
-      <View style={styles.topHeader}>
-        <Text style={styles.appTitle}>Universal File Viewer</Text>
-        <View style={styles.headerRightActions}>
-          <TouchableOpacity
-            style={styles.iconButton}
-            onPress={() => setIsSearchVisible((prev) => !prev)}
-            activeOpacity={0.7}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-            <Text style={styles.headerSearchIcon}>🔍</Text>
-          </TouchableOpacity>
+      {/* 1. FIGMA HEADER (White Header with My Files & Coins) */}
+      <View style={styles.header}>
+        <View style={styles.headerTopRow}>
+          <View style={styles.brandContainer}>
+            <FolderOutlineIcon size={22} color="#016EEF" />
+            <Text style={styles.brandTitle}>My Files</Text>
+          </View>
+
+          <View style={styles.headerRightActions}>
+            {/* Coin Balance Pill (Figma Screen 2 & 3: (🪙 120)) */}
+            <TouchableOpacity
+              style={styles.coinPill}
+              activeOpacity={0.8}
+              onPress={() => setIsRewardsVisible(true)}>
+              <CoinIcon size={15} color="#016EEF" />
+              <Text style={styles.coinValue}>{walletBalance}</Text>
+            </TouchableOpacity>
+
+            {/* Settings Gear Icon */}
+            <TouchableOpacity
+              style={styles.settingsBtn}
+              activeOpacity={0.7}
+              onPress={() => setIsSettingsVisible(true)}>
+              <SettingsGearIcon size={18} color="#0F172A" />
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
 
-      {/* Expandable Instant Search Bar */}
-      {(isSearchVisible || searchQuery.length > 0) && (
-        <View style={styles.searchContainer}>
-          <Text style={styles.searchIcon}>🔍</Text>
+        {/* 2. SEARCH PILL (Figma: Search files by name) */}
+        <View style={styles.searchBarContainer}>
+          <SearchOutlineIcon size={18} color="#016EEF" />
           <TextInput
             style={styles.searchInput}
-            placeholder="Search documents, sheets, media..."
-            placeholderTextColor="#94a3b8"
+            placeholder="Search files by name"
+            placeholderTextColor="#5B6478"
             value={searchQuery}
             onChangeText={setSearchQuery}
-            autoFocus={isSearchVisible && searchQuery.length === 0}
+            clearButtonMode="while-editing"
           />
           {searchQuery.length > 0 && (
             <TouchableOpacity
               onPress={() => setSearchQuery('')}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <Text style={styles.clearSearchIcon}>✕</Text>
+              style={styles.clearSearchPill}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <Text style={styles.clearSearchPillText}>✕</Text>
             </TouchableOpacity>
           )}
         </View>
-      )}
-
-      {/* Storage Used Elevated Card */}
-      <View style={styles.storageCard}>
-        <View style={styles.storageTopRow}>
-          <View style={styles.storageIconBox}>
-            <Text style={styles.storageIcon}>📰</Text>
-          </View>
-          <View style={styles.storageTextBox}>
-            <Text style={styles.storageLabel}>Storage Used</Text>
-            <Text style={styles.storageUsedValue}>
-              {usedGB} GB of {totalGB} GB used
-            </Text>
-          </View>
-        </View>
-
-        {/* Progress Bar */}
-        <View style={styles.storageProgressTrack}>
-          <View style={[styles.storageProgressFill, { width: `${progressPercent}%` }]} />
-        </View>
-
-        {/* Action Link */}
-        <TouchableOpacity
-          onPress={handleCleanUpStorage}
-          disabled={isCleaning}
-          activeOpacity={0.7}
-          style={styles.cleanupRow}>
-          <Text style={styles.cleanupText}>
-            {freeGB} GB free • <Text style={styles.cleanupAction}>Tap to clean up &gt;</Text>
-          </Text>
-        </TouchableOpacity>
       </View>
 
-      {/* Permission Recommendation Banner (if needed) */}
-      {!isPermissionBannerDismissed &&
-        (permissionState.media !== 'granted' || !permissionState.documentsTreeGranted) && (
-          <View style={styles.permissionCard}>
-            <View style={styles.permissionHeader}>
-              <Text style={styles.permissionIcon}>🛡️</Text>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.permissionTitle}>Full Storage Access Recommended</Text>
-                <Text style={styles.permissionDesc}>
-                  Grant access to Documents & Media so Universal File Viewer can discover all office files
-                  and archives across your device.
-                </Text>
+      {/* MAIN SCROLLABLE CONTENT */}
+      <ScrollView
+        style={styles.scrollBody}
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}>
+
+        {/* 3. HERO CARD (Figma: Browse your files with folder tab) */}
+        <View style={styles.heroWrap}>
+          {/* Top Folder Tab with smooth slope */}
+          <View style={styles.heroTabRow}>
+            <View style={styles.heroTabBody} />
+            <View style={styles.heroTabSlope} />
+          </View>
+          <View style={styles.heroCard}>
+            <View style={styles.heroLeft}>
+              <Text style={styles.heroTitle}>Browse your files</Text>
+              <Text style={styles.heroSubtitle}>Find files and folders on your device</Text>
+
+              {/* Format Pills Row */}
+              <View style={styles.formatPillsRow}>
+                {['PDF', 'DOCX', 'XLSX', 'ZIP', 'MP4'].map((fmt) => (
+                  <View key={fmt} style={styles.heroFormatPill}>
+                    <Text style={styles.heroFormatPillText}>{fmt}</Text>
+                  </View>
+                ))}
               </View>
-              <TouchableOpacity onPress={() => setIsPermissionBannerDismissed(true)}>
-                <Text style={styles.dismissText}>✕</Text>
-              </TouchableOpacity>
             </View>
-            <View style={styles.permissionBtnRow}>
-              {permissionState.media !== 'granted' && (
-                <TouchableOpacity style={styles.permActionBtn} onPress={requestMediaPermissions}>
-                  <Text style={styles.permActionBtnText}>Grant Media</Text>
-                </TouchableOpacity>
-              )}
-              {!permissionState.documentsTreeGranted && (
-                <TouchableOpacity
-                  style={[styles.permActionBtn, { backgroundColor: '#10b981' }]}
-                  onPress={requestDocumentsTree}>
-                  <Text style={styles.permActionBtnText}>Select Documents Folder</Text>
-                </TouchableOpacity>
-              )}
+
+            {/* Figma Circle Action Button with Royal Blue Arrow */}
+            <TouchableOpacity
+              style={styles.heroActionBtn}
+              activeOpacity={0.85}
+              onPress={handleHeroBrowse}>
+              <RightArrowIcon size={20} color="#016EEF" strokeWidth={2.4} />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* 4. 4 CATEGORY QUICK BUTTONS (Figma: Documents, Sheets, Images, Archives) */}
+        <View style={styles.categoryGrid}>
+          {/* Documents */}
+          <TouchableOpacity
+            style={styles.categoryItem}
+            activeOpacity={0.75}
+            onPress={() => handleCategoryPress('DOCUMENTS')}>
+            <View style={[styles.categoryIconBox, { backgroundColor: '#FEE2E2' }]}>
+              <CategoryDocIcon size={24} color="#DC2626" />
             </View>
+            <Text style={styles.categoryLabel}>Documents</Text>
+          </TouchableOpacity>
+
+          {/* Sheets */}
+          <TouchableOpacity
+            style={styles.categoryItem}
+            activeOpacity={0.75}
+            onPress={() => handleCategoryPress('SPREADSHEETS')}>
+            <View style={[styles.categoryIconBox, { backgroundColor: '#DCFCE7' }]}>
+              <CategorySheetIcon size={24} color="#16A34A" />
+            </View>
+            <Text style={styles.categoryLabel}>Sheets</Text>
+          </TouchableOpacity>
+
+          {/* Images */}
+          <TouchableOpacity
+            style={styles.categoryItem}
+            activeOpacity={0.75}
+            onPress={() => handleCategoryPress('IMAGES')}>
+            <View style={[styles.categoryIconBox, { backgroundColor: '#EDE9FE' }]}>
+              <CategoryImgIcon size={24} color="#7C3AED" />
+            </View>
+            <Text style={styles.categoryLabel}>Images</Text>
+          </TouchableOpacity>
+
+          {/* Archives */}
+          <TouchableOpacity
+            style={styles.categoryItem}
+            activeOpacity={0.75}
+            onPress={() => handleCategoryPress('ARCHIVES')}>
+            <View style={[styles.categoryIconBox, { backgroundColor: '#FEF3C7' }]}>
+              <CategoryArchiveIcon size={24} color="#D97706" />
+            </View>
+            <Text style={styles.categoryLabel}>Archives</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* 5. CONTINUE READING (Figma Image 1: Populated State Only) */}
+        {isPopulated && effectiveContinueFile && (
+          <View style={styles.sectionContainer}>
+            <Text style={styles.continueSectionTitle}>Continue reading</Text>
+            <TouchableOpacity
+              style={styles.continueCard}
+              activeOpacity={0.8}
+              onPress={() => handleOpenFile(effectiveContinueFile)}>
+              <DocumentFileBadgeIcon
+                label="PDF"
+                badgeBg="#DC2626"
+                badgeText="#FFFFFF"
+                width={40}
+                height={48}
+              />
+              <View style={styles.continueInfo}>
+                <Text style={styles.continueName} numberOfLines={1}>
+                  {effectiveContinueFile.name}
+                </Text>
+                <Text style={styles.continueMeta}>
+                  {effectiveContinueFile.pos?.page && effectiveContinueFile.pos?.total ? `Page ${effectiveContinueFile.pos.page} of ${effectiveContinueFile.pos.total} · ${formatRelativeTime(effectiveContinueFile.pos.timestamp)}` : formatRelativeTime(effectiveContinueFile.timestamp)}
+                </Text>
+                {/* Figma blue progress line */}
+                <View style={styles.continueProgressLineTrack}>
+                  <View style={[styles.continueProgressLineFill, { width: effectiveContinueFile?.pos?.page && effectiveContinueFile?.pos?.total ? `${Math.round((effectiveContinueFile.pos.page / effectiveContinueFile.pos.total) * 100)}%` : '25%' }]} />
+                </View>
+              </View>
+            </TouchableOpacity>
           </View>
         )}
 
-      {/* 4. Categories Section (2-Column Grid of 8 Cards) */}
-      <View style={styles.categoriesSection}>
-        <View style={styles.sectionHeaderRow}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <Text style={styles.sectionTitle}>Categories</Text>
-            {isScanningDashboard && <ActivityIndicator color="#2563eb" size="small" />}
-          </View>
-          {selectedCategory !== 'ALL' && (
-            <TouchableOpacity onPress={() => setSelectedCategory('ALL')}>
-              <Text style={styles.resetFilterText}>Show All</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-
-        <View style={styles.categoriesGrid}>
-          {CATEGORIES.map((cat) => {
-            const isSelected = selectedCategory === cat.id;
-            const fileCount =
-              dashboardCounts && dashboardCounts[cat.countKey]
-                ? dashboardCounts[cat.countKey].count
-                : 0;
-
-            return (
-              <TouchableOpacity
-                key={cat.id}
-                style={[
-                  styles.categoryCard,
-                  isSelected && styles.categoryCardSelected,
-                ]}
-                onPress={() => setSelectedCategory(isSelected ? 'ALL' : cat.id)}
-                activeOpacity={0.75}>
-                {/* Square Icon Badge */}
-                <View
-                  style={[
-                    styles.categoryBadge,
-                    { backgroundColor: cat.badgeColor },
-                  ]}>
-                  <Text
-                    style={[
-                      styles.categoryBadgeText,
-                      cat.isBadgeIcon && styles.categoryBadgeIconText,
-                    ]}>
-                    {cat.badgeLabel}
-                  </Text>
-                </View>
-
-                {/* Name & Count */}
-                <View style={styles.categoryInfo}>
-                  <Text style={styles.categoryName} numberOfLines={1}>
-                    {cat.name}
-                  </Text>
-                  <Text style={styles.categoryCount}>
-                    {fileCount} files
-                  </Text>
-                </View>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-      </View>
-
-      {/* 4.5 Continue Reading (if any) */}
-      {continueFiles.length > 0 && selectedCategory === 'ALL' && !searchQuery && (
-        <View style={styles.continueSection}>
+        {/* 6. RECENT FILES (Figma Image 1 Populated vs Image 2 First Launch) */}
+        <View style={styles.sectionContainer}>
           <View style={styles.sectionHeaderRow}>
-            <Text style={styles.sectionTitle}>Continue Reading</Text>
-            <Text style={styles.continueSub}>Pick up where you left off</Text>
-          </View>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.continueScroll}>
-            {continueFiles.map((item) => {
-              const badgeInfo = getBadgeForFile(item.category, item.name);
-              return (
-                <TouchableOpacity
-                  key={`continue-${item.path}`}
-                  style={styles.continueCard}
-                  onPress={() => openMatchingViewer(item.name, item.path, item.category)}
-                  activeOpacity={0.8}>
-                  <View style={styles.continueCardHeader}>
-                    <View style={[styles.miniBadge, { backgroundColor: badgeInfo.bg }]}>
-                      <Text style={styles.miniBadgeText}>{badgeInfo.label}</Text>
-                    </View>
-                    <Text style={styles.continueProgress}>Resume</Text>
-                  </View>
-                  <Text style={styles.continueFileName} numberOfLines={2}>
-                    {item.name}
-                  </Text>
-                  <View style={styles.continueFooter}>
-                    <Text style={styles.continueResumeText}>Open ➔</Text>
-                  </View>
-                </TouchableOpacity>
-              );
-            })}
-          </ScrollView>
-        </View>
-      )}
-
-      {/* 5. Recent Files Section (Card Container) */}
-      <View style={styles.recentSection}>
-        <View style={styles.sectionHeaderRow}>
-          <Text style={styles.sectionTitle}>
-            {selectedCategory === 'STARRED'
-              ? 'Starred files'
-              : selectedCategory !== 'ALL'
-              ? `${selectedCategory} files`
-              : 'Recent files'}
-          </Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-            {recentFiles.length > 0 && selectedCategory === 'ALL' && (
-              <TouchableOpacity onPress={handleClearRecents} activeOpacity={0.7}>
-                <Text style={styles.clearRecentsText}>Clear</Text>
+            <Text style={styles.sectionTitle}>Recent files</Text>
+            {isPopulated && (
+              <TouchableOpacity
+                activeOpacity={0.7}
+                onPress={() => navigation?.navigate('Browse', { showRecents: true })}>
+                <Text style={styles.seeAllLink}>See all &gt;</Text>
               </TouchableOpacity>
             )}
-            <TouchableOpacity
-              onPress={() => navigation?.navigate('FolderBrowser')}
-              activeOpacity={0.7}>
-              <Text style={styles.seeAllText}>See all &gt;</Text>
-            </TouchableOpacity>
+          </View>
+
+          {searchQuery.trim().length > 0 && effectiveRecentFiles.length === 0 ? (
+            <View style={styles.searchEmptyCenterBox}>
+              <View style={styles.searchEmptyIconCircle}>
+                <SearchOutlineIcon size={24} color="#016EEF" />
+              </View>
+              <Text style={styles.searchEmptyTitle}>No results for "{searchQuery}"</Text>
+              <Text style={styles.searchEmptySub}>
+                Check the spelling, or try a different file type.
+              </Text>
+              <TouchableOpacity
+                style={styles.searchClearBtn}
+                activeOpacity={0.8}
+                onPress={() => setSearchQuery('')}>
+                <Text style={styles.searchClearBtnText}>Clear search</Text>
+              </TouchableOpacity>
+            </View>
+          ) : !isPopulated ? (
+            /* FIGMA IMAGE 2: FIRST LAUNCH EMPTY STATE */
+            <View style={styles.emptyContainer}>
+              <View style={styles.emptyDashedBox}>
+                {/* Top Row: Folded Doc Outline + Title/Sub */}
+                <View style={styles.emptyTopRow}>
+                  <EmptyDocOutlineIcon size={40} color="#94A3B8" />
+                  <View style={styles.emptyTextCol}>
+                    <Text style={styles.emptyTitle}>Nothing opened yet</Text>
+                    <Text style={styles.emptySubtitle}>Files you open will show up here.</Text>
+                  </View>
+                </View>
+
+                {/* Steps 1 & 2 */}
+                <View style={styles.emptyStepsBox}>
+                  <View style={styles.emptyStepRow}>
+                    <View style={styles.emptyStepNumCircle}>
+                      <Text style={styles.emptyStepNum}>1</Text>
+                    </View>
+                    <Text style={styles.emptyStepText}>
+                      Tap <Text style={styles.emptyStepBold}>Browse your files</Text> and pick a document, image or archive.
+                    </Text>
+                  </View>
+
+                  <View style={styles.emptyStepRow}>
+                    <View style={styles.emptyStepNumCircle}>
+                      <Text style={styles.emptyStepNum}>2</Text>
+                    </View>
+                    <Text style={styles.emptyStepText}>
+                      Or choose this app when opening a file from another app.
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Primary Action Button */}
+                <TouchableOpacity
+                  style={styles.browseDeviceBtn}
+                  activeOpacity={0.8}
+                  onPress={handleBrowseDeviceFiles}>
+                  <FolderOutlineIcon size={16} color="#FFFFFF" />
+                  <Text style={styles.browseDeviceBtnText}>Browse device files</Text>
+                </TouchableOpacity>
+
+                {/* Footnote divider and text INSIDE the dashed container (Figma Image 1) */}
+                <View style={styles.emptyFootnoteDivider} />
+                <Text style={styles.emptyFooterNote}>No account or sign-in needed.</Text>
+              </View>
+            </View>
+          ) : (
+            /* FIGMA IMAGE 1: POPULATED RECENT FILES LIST */
+            <View style={styles.recentFilesListCard}>
+              {effectiveRecentFiles.slice(0, 5).map((file: RecentFile, idx: number, arr: RecentFile[]) => {
+                const badge = getBadgeForFile(file.name);
+                const isStarred = MMKV.isStarred(file.path);
+                const isLast = idx === arr.length - 1;
+
+                return (
+                  <View key={`${file.path}-${idx}`} style={[styles.recentRow, !isLast && styles.recentRowDivider]}>
+                    <TouchableOpacity
+                      style={styles.recentRowContent}
+                      activeOpacity={0.7}
+                      onPress={() => handleOpenFile(file)}>
+                      {/* Figma 40x48 Document Card with Folded Corner & Pinned Badge */}
+                      <DocumentFileBadgeIcon
+                        label={badge.label}
+                        badgeBg={badge.bg}
+                        badgeText={badge.text}
+                        width={40}
+                        height={48}
+                      />
+
+                      {/* File Info */}
+                      <View style={styles.recentMetaBox}>
+                        <Text style={styles.recentFileName} numberOfLines={1}>
+                          {file.name}
+                        </Text>
+                        <Text style={styles.recentFileSub}>
+                          {badge.label} · {formatBytes(file.size)} · {formatRelativeTime(file.timestamp)}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+
+                    {/* 3-Dot Action Menu (Figma Menu Modal trigger) */}
+                    <TouchableOpacity
+                      style={styles.moreActionBtn}
+                      activeOpacity={0.7}
+                      hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      onPress={() =>
+                        setActionMenuFile({
+                          name: file.name,
+                          path: file.path,
+                          size: file.size || 0,
+                          lastModified: file.timestamp,
+                          category: file.category,
+                          isStarred,
+                        })
+                      }>
+                      <Text style={styles.moreActionDots}>⋮</Text>
+                    </TouchableOpacity>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+        </View>
+
+        {/* 7. INTERNAL STORAGE GAUGE (Figma Image 1 & 2: Header inside card) */}
+        <View style={styles.sectionContainer}>
+          <View style={styles.storageCard}>
+            {/* Header row INSIDE the storage card (Figma layout) */}
+            <View style={styles.storageHeaderRow}>
+              <View style={styles.storageHeaderLeft}>
+                <HardDriveStorageIcon size={18} color="#0F172A" />
+                <Text style={styles.storageTitle}>Internal Storage</Text>
+              </View>
+              <Text style={styles.storageAvailableText}>Available</Text>
+            </View>
+
+            {/* Multi-segment Progress Bar: Blue, Green, Slate, Light Grey Track (Figma: 6px height) */}
+            <View style={styles.storageProgressBarTrack}>
+              <View style={[styles.storageSegmentMedia, { flex: mediaFlex }]} />
+              <View style={[styles.storageSegmentDocs, { flex: docsFlex }]} />
+              <View style={[styles.storageSegmentOther, { flex: otherFlex }]} />
+              <View style={[styles.storageSegmentFree, { flex: freeFlex }]} />
+            </View>
+
+            {/* Storage Numbers Row */}
+            <View style={styles.storageNumbersRow}>
+              <Text style={styles.storageUsedText}>
+                {usedGb ? `${usedGb} GB used` : '-- GB used'}
+              </Text>
+              <Text style={styles.storageTotalText}>
+                {totalGb ? `${totalGb} GB total` : '-- GB total'}
+              </Text>
+            </View>
+
+            {/* Storage Legend Row: Media, Docs, System */}
+            <View style={styles.storageLegendRow}>
+              <View style={styles.legendItem}>
+                <View style={[styles.legendDot, { backgroundColor: '#016EEF' }]} />
+                <Text style={styles.legendText}>{`Media (${mediaGbText})`}</Text>
+              </View>
+
+              <View style={styles.legendItem}>
+                <View style={[styles.legendDot, { backgroundColor: '#86EFAC' }]} />
+                <Text style={styles.legendText}>{`Docs (${docsGbText})`}</Text>
+              </View>
+
+              <View style={styles.legendItem}>
+                <View style={[styles.legendDot, { backgroundColor: '#475569' }]} />
+                <Text style={styles.legendText}>{`System (${othersGbText})`}</Text>
+              </View>
+            </View>
           </View>
         </View>
 
-        {isLoadingCategoryFiles ? (
-          <View style={styles.loadingBox}>
-            <ActivityIndicator color="#2563eb" size="small" />
-            <Text style={styles.loadingText}>Scanning files...</Text>
-          </View>
-        ) : displayedFiles.length === 0 ? (
-          <View style={styles.emptyRecentCard}>
-            <Text style={styles.emptyRecentIcon}>📂</Text>
-            <Text style={styles.emptyRecentTitle}>
-              {selectedCategory === 'STARRED'
-                ? 'No Starred Files'
-                : selectedCategory !== 'ALL'
-                ? `No ${selectedCategory} files found`
-                : 'No Recent Files'}
-            </Text>
-            <Text style={styles.emptyRecentSub}>
-              {selectedCategory === 'STARRED'
-                ? 'Tap the star on any file to quickly access your favorite documents here.'
-                : 'Files you open will appear here for fast offline reading.'}
-            </Text>
-          </View>
-        ) : (
-          <View style={styles.recentFilesCard}>
-            {displayedFiles.slice(0, 10).map((item, idx, arr) => {
-              const badge = getBadgeForFile(item.category, item.name);
-              const isLast = idx === arr.length - 1;
-              const isStarred = MMKV.isStarred(item.path);
-
-              return (
+        {/* 8. SPONSORED BANNER CARD (Figma Image 1: Populated State Only) */}
+        {isPopulated && !isAdFreeActive && sponsorCard && (
+          <View style={styles.sponsorCard}>
+            <View style={styles.sponsorTopRow}>
+              <View style={styles.sponsorBadge}>
+                <Text style={styles.sponsorBadgeText}>Sponsored</Text>
+              </View>
+              <View style={styles.sponsorRightTop}>
                 <TouchableOpacity
-                  key={`${item.path}-${idx}`}
-                  style={[styles.recentItemRow, !isLast && styles.recentItemDivider]}
-                  onPress={() => handleRecentTap(item)}
-                  onLongPress={() =>
-                    setSelectedDetailFile({
-                      name: item.name,
-                      path: item.path,
-                      size: item.size,
-                      lastModified: item.timestamp,
-                      mimeType: item.mimeType,
-                      category: item.category,
-                      isStarred,
-                    })
-                  }
-                  activeOpacity={0.7}>
-                  {/* Badge */}
-                  <View style={[styles.fileBadge, { backgroundColor: badge.bg }]}>
-                    <Text
-                      style={[
-                        styles.fileBadgeText,
-                        badge.isIcon && styles.fileBadgeIconText,
-                      ]}>
-                      {badge.label}
-                    </Text>
-                  </View>
-
-                  {/* File Info */}
-                  <View style={styles.fileInfo}>
-                    <Text style={styles.fileName} numberOfLines={1}>
-                      {item.name}
-                    </Text>
-                    <Text style={styles.fileMeta}>
-                      {formatRelativeTime(item.timestamp)} • {formatBytes(item.size)}
-                    </Text>
-                  </View>
-
-                  {/* Star Favorite Button */}
-                  <TouchableOpacity
-                    onPress={() => handleToggleStar(item)}
-                    style={styles.starActionBtn}
-                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-                    <Text style={[styles.starActionText, isStarred && styles.starActive]}>
-                      {isStarred ? '★' : '☆'}
-                    </Text>
-                  </TouchableOpacity>
+                  onPress={() => setIsWalletVisible(true)}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Text style={styles.whyThisAdText}>Why this ad?</Text>
                 </TouchableOpacity>
-              );
-            })}
+                <TouchableOpacity
+                  onPress={() => setSponsorCard(null)}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Text style={styles.sponsorCloseIcon}>✕</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View style={styles.sponsorContentRow}>
+              <View style={styles.sponsorAppIcon}>
+                <DocScannerIcon size={22} color="#7C3AED" />
+              </View>
+              <View style={styles.sponsorTextBox}>
+                <Text style={styles.sponsorHeadline}>{sponsorCard.headline || 'Scan paper documents in seconds'}</Text>
+                <Text style={styles.sponsorSubline}>{sponsorCard.body || 'ExampleScan · Free on the Play Store'}</Text>
+              </View>
+            </View>
           </View>
         )}
-      </View>
 
-      {/* Quick Action Buttons (Browse & Pick) */}
-      <View style={styles.quickActionRow}>
-        <TouchableOpacity
-          style={styles.quickActionBtnPrimary}
-          onPress={() => navigation?.navigate('FolderBrowser')}
-          activeOpacity={0.8}>
-          <Text style={styles.quickActionIcon}>📁</Text>
-          <View>
-            <Text style={styles.quickActionTitlePrimary}>Browse Folders</Text>
-            <Text style={styles.quickActionSubPrimary}>Explore SD card & Downloads</Text>
-          </View>
-        </TouchableOpacity>
+        <View style={{ height: 40 }} />
+      </ScrollView>
 
-        <TouchableOpacity
-          style={styles.quickActionBtnSecondary}
-          onPress={async () => {
-            try {
-              const res = await engine.pickFile();
-              const detected = await FileDetector.detectFile(res.path, res.name);
-              MMKV.addRecentFile({
-                name: res.name,
-                path: res.path,
-                size: res.size || 0,
-                timestamp: Date.now(),
-                category: detected.category,
-                mimeType: detected.mimeType,
-              });
-              loadData();
-              openMatchingViewer(res.name, res.path, detected.category);
-            } catch (err) {
-              console.warn('Pick file cancelled or failed', err);
-            }
-          }}
-          activeOpacity={0.8}>
-          <Text style={styles.quickActionIconSecondary}>📂</Text>
-          <View>
-            <Text style={styles.quickActionTitleSecondary}>Pick Any File</Text>
-            <Text style={styles.quickActionSubSecondary}>Open offline instantly</Text>
-          </View>
-        </TouchableOpacity>
-      </View>
+      {/* 9. FIGMA ACTION MENU MODAL (Open, Share, Star, Remove, File Information) */}
+      <FileActionMenuModal
+        visible={actionMenuFile !== null}
+        file={actionMenuFile}
+        isRecentItem={true}
+        onClose={() => setActionMenuFile(null)}
+        onOpen={(f) => handleOpenFile(f)}
+        onShare={(f) => handleShareFile(f)}
+        onToggleStar={(f) => handleToggleStar(f)}
+        onRemoveRecent={(f) => handleRemoveRecent(f)}
+        onFileInfo={(f) => {
+          setInfoModalFile({
+            name: f.name,
+            path: f.path,
+            size: f.size,
+            lastModified: f.lastModified,
+            category: f.category,
+          });
+        }}
+      />
 
-      {/* Clean Up Feedback Modal */}
+      {/* 10. FIGMA FILE INFORMATION MODAL */}
+      <FileInformationModal
+        visible={infoModalFile !== null}
+        file={infoModalFile}
+        onClose={() => setInfoModalFile(null)}
+        onOpen={(f) => handleOpenFile(f)}
+        onShare={(f) => handleShareFile(f)}
+      />
+
+      {/* 11. WALLET MODAL */}
+      <WalletModal
+        visible={isWalletVisible}
+        onClose={() => setIsWalletVisible(false)}
+        onStateChanged={() => {
+          setWalletBalance(walletService.getBalance());
+          setIsAdFreeActive(walletService.isAdFreeActive());
+        }}
+      />
+
+      {/* 12. IN-APP SETTINGS MODAL */}
       <Modal
-        visible={isCleanModalVisible}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setIsCleanModalVisible(false)}>
-        <View style={styles.cleanModalOverlay}>
-          <View style={styles.cleanModalCard}>
-            <View style={styles.cleanIconBox}>
-              <Text style={styles.cleanIconText}>✨</Text>
-            </View>
-            <Text style={styles.cleanModalTitle}>Storage Cleaned!</Text>
-            <Text style={styles.cleanModalDesc}>
-              Successfully cleaned temporary preview caches and unzipped temp files.
-            </Text>
-            <View style={styles.cleanStatsRow}>
-              <Text style={styles.cleanSavedText}>{cleanedAmount || 'Cache is already clean and optimal (0 B)'}</Text>
-            </View>
-            <TouchableOpacity
-              style={styles.cleanModalBtn}
-              onPress={() => setIsCleanModalVisible(false)}>
-              <Text style={styles.cleanModalBtnText}>Done</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+        visible={isSettingsVisible}
+        animationType="slide"
+        statusBarTranslucent={false}
+        onRequestClose={() => setIsSettingsVisible(false)}>
+        <SettingsScreen
+          onBack={() => setIsSettingsVisible(false)}
+          onOpenAuth={(mode) => {
+            setAuthModalState({ visible: true, mode: (mode as AuthMode) || 'SIGN_IN' });
+          }}
+          onOpenRewards={() => {
+            setIsSettingsVisible(false);
+            setIsRewardsVisible(true);
+          }}
+          onOpenPaywall={() => {
+            setIsSettingsVisible(false);
+            setIsPaywallVisible(true);
+          }}
+        />
       </Modal>
 
-      {/* Viewer Modal */}
+      {/* 13. REWARDS & COINS SCREEN MODAL */}
+      <Modal
+        visible={isRewardsVisible}
+        animationType="slide"
+        statusBarTranslucent={false}
+        onRequestClose={() => {
+          setIsRewardsVisible(false);
+          setWalletBalance(walletService.getBalance());
+          setIsAdFreeActive(walletService.isAdFreeActive());
+        }}>
+        <RewardsScreen
+          onBack={() => {
+            setIsRewardsVisible(false);
+            setWalletBalance(walletService.getBalance());
+            setIsAdFreeActive(walletService.isAdFreeActive());
+          }}
+          onOpenPaywall={() => {
+            setIsRewardsVisible(false);
+            setIsPaywallVisible(true);
+          }}
+        />
+      </Modal>
+
+      {/* 14. PREMIUM PAYWALL SCREEN MODAL */}
+      <Modal
+        visible={isPaywallVisible}
+        animationType="slide"
+        statusBarTranslucent={false}
+        onRequestClose={() => setIsPaywallVisible(false)}>
+        <PremiumPaywallScreen
+          onClose={() => setIsPaywallVisible(false)}
+          onUpgradeSuccess={() => {
+            setIsPaywallVisible(false);
+            setWalletBalance(walletService.getBalance());
+            setIsAdFreeActive(walletService.isAdFreeActive());
+          }}
+        />
+      </Modal>
+
+      {/* 15. AUTH & ACCOUNT MODAL */}
+      <Modal
+        visible={authModalState.visible}
+        animationType="slide"
+        statusBarTranslucent={false}
+        onRequestClose={() => setAuthModalState({ visible: false })}>
+        <AuthScreen
+          initialMode={authModalState.mode || 'SIGN_IN'}
+          onBack={() => setAuthModalState({ visible: false })}
+          onAuthSuccess={() => {
+            setAuthModalState({ visible: false });
+          }}
+        />
+      </Modal>
+
+
+      {/* 14. DOCUMENT & MEDIA VIEWERS */}
       <Modal
         visible={activeViewer !== null}
         animationType="slide"
-        statusBarTranslucent={true}
+        statusBarTranslucent={false}
         onRequestClose={() => setActiveViewer(null)}>
         {activeViewer && (
-          <View
-            style={[
-              styles.modalWrapper,
-              {
-                backgroundColor:
-                  activeViewer.category === 'OFFICE_XLSX' || activeViewer.category === 'LEGACY_OLE_XLS'
-                    ? '#107c41'
-                    : activeViewer.category === 'PDF' || activeViewer.category === 'TEXT_CODE'
-                    ? '#ffffff'
-                    : '#1e293b',
-              },
-            ]}>
-            <StatusBar
-              barStyle={
-                activeViewer.category === 'PDF' || activeViewer.category === 'TEXT_CODE'
-                  ? 'dark-content'
-                  : 'light-content'
-              }
-              backgroundColor={
-                activeViewer.category === 'OFFICE_XLSX' || activeViewer.category === 'LEGACY_OLE_XLS'
-                  ? '#107c41'
-                  : activeViewer.category === 'PDF' || activeViewer.category === 'TEXT_CODE'
-                  ? '#ffffff'
-                  : '#1e293b'
-              }
-              translucent={true}
-            />
-
+          <View style={styles.viewerWrapper}>
             {activeViewer.category === 'PDF' && (
               <PdfViewer
                 filePath={activeViewer.path}
                 fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
               />
             )}
-
             {(activeViewer.category === 'OFFICE_DOCX' ||
               activeViewer.category === 'OFFICE_PPTX' ||
               activeViewer.category === 'LEGACY_OLE_DOC' ||
               activeViewer.category === 'LEGACY_OLE_PPT') && (
-              <OfficeViewer
-                filePath={activeViewer.path}
-                fileName={activeViewer.file}
-                formatType={activeViewer.formatType || 'DOCX'}
-                onClose={() => setActiveViewer(null)}
-              />
-            )}
-
-            {activeViewer.category === 'ARCHIVE_RAR' && (
-              <RarViewerScreen
-                filePath={activeViewer.path}
-                fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
-              />
-            )}
-
-            {activeViewer.category === 'ARCHIVE_ZIP' && (
-              <ZipViewerScreen
-                filePath={activeViewer.path}
-                fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
-              />
-            )}
-
-            {(activeViewer.category === 'OFFICE_XLSX' ||
-              activeViewer.category === 'LEGACY_OLE_XLS') && (
+                <OfficeViewer
+                  filePath={activeViewer.path}
+                  fileName={activeViewer.file}
+                  formatType={activeViewer.formatType || 'DOCX'}
+                  onClose={() => {
+                    setActiveViewer(null);
+                    loadData();
+                  }}
+                />
+              )}
+            {activeViewer.category === 'OFFICE_XLSX' && (
               <XlsxViewer
                 filePath={activeViewer.path}
                 fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
               />
             )}
-
             {activeViewer.category === 'SPREADSHEET_CSV' && (
               <CsvViewer
                 filePath={activeViewer.path}
                 fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
               />
             )}
-
+            {activeViewer.category === 'ARCHIVE_RAR' && (
+              <RarViewerScreen
+                filePath={activeViewer.path}
+                fileName={activeViewer.file}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
+              />
+            )}
+            {activeViewer.category === 'ARCHIVE_ZIP' && (
+              <ZipViewerScreen
+                filePath={activeViewer.path}
+                fileName={activeViewer.file}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
+              />
+            )}
             {activeViewer.category === 'IMAGE' && (
               <ImageViewer
                 filePath={activeViewer.path}
                 fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
               />
             )}
-
-            {activeViewer.category === 'TEXT_CODE' && (
-              <TextViewer
-                filePath={activeViewer.path}
-                fileName={activeViewer.file}
-                onClose={() => setActiveViewer(null)}
-              />
-            )}
-
             {(activeViewer.category === 'VIDEO' || activeViewer.category === 'AUDIO') && (
               <MediaViewer
                 filePath={activeViewer.path}
                 fileName={activeViewer.file}
-                category={activeViewer.category as any}
-                onClose={() => setActiveViewer(null)}
+                category={activeViewer.category as 'VIDEO' | 'AUDIO'}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
+              />
+            )}
+            {activeViewer.category === 'TEXT_CODE' && (
+              <TextViewer
+                filePath={activeViewer.path}
+                fileName={activeViewer.file}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
+              />
+            )}
+            {activeViewer.category === 'UNSUPPORTED' && (
+              <UnsupportedFileScreen
+                filePath={activeViewer.path}
+                fileName={activeViewer.file}
+                onClose={() => {
+                  setActiveViewer(null);
+                  loadData();
+                }}
               />
             )}
           </View>
         )}
       </Modal>
 
-      {/* File Details Sheet Modal */}
-      <FileDetailsModal
-        visible={selectedDetailFile !== null}
-        file={selectedDetailFile}
-        onClose={() => setSelectedDetailFile(null)}
-        onOpen={(f) =>
-          handleRecentTap({
-            name: f.name,
-            path: f.path,
-            size: f.size || 0,
-            timestamp: Date.now(),
-            category: f.category || 'UNKNOWN',
-          })
-        }
-        onToggleStar={(f) => handleToggleStar(f)}
-      />
-    </ScrollView>
+      {/* 15. STRICT STATE MACHINE LOADING / RECOVERY OVERLAY */}
+      {stateMachine.state !== 'IDLE' && stateMachine.state !== 'READY' && (
+        <FileOpeningStateView
+          state={stateMachine.state}
+          context={stateMachine.context}
+          onRetry={stateMachine.retry}
+          onCancel={stateMachine.cancel}
+          onRequestAccess={requestAllFilesAccess}
+        />
+      )}
+    </View>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8fafc',
+    backgroundColor: FigmaTheme.colors.background,
   },
-  content: {
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 32,
+  viewerWrapper: {
+    flex: 1,
+    backgroundColor: '#016EEF',
+    paddingTop: 0,
   },
-  topHeader: {
+
+  // 1. Header (White in Figma Screen 2)
+  header: {
+    backgroundColor: '#FFFFFF',
+    paddingTop: 12,
+    paddingBottom: 14,
+    paddingHorizontal: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  headerTopRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 16,
-    paddingTop: Platform.OS === 'android' ? 6 : 0,
+    marginBottom: 14,
   },
-  appTitle: {
+  brandContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  brandIcon: {
     fontSize: 22,
+  },
+  brandTitle: {
+    fontSize: 20,
     fontWeight: '800',
-    color: '#0f172a',
+    color: '#0F172A',
     letterSpacing: -0.3,
   },
   headerRightActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 10,
   },
-  iconButton: {
+  coinPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    gap: 6,
+  },
+  coinEmoji: {
+    fontSize: 14,
+  },
+  coinValue: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#016EEF',
+  },
+  settingsBtn: {
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
     justifyContent: 'center',
     alignItems: 'center',
   },
-  headerSearchIcon: {
-    fontSize: 16,
+  settingsIcon: {
+    fontSize: 18,
   },
-  searchContainer: {
+
+  // Search Bar (White with soft border in Figma)
+  searchBarContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#ffffff',
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.2,
+    borderColor: '#E2E8F0',
+    borderRadius: 25,
+    paddingHorizontal: 20,
+    height: 50,
   },
   searchIcon: {
-    fontSize: 15,
+    fontSize: 16,
     marginRight: 10,
+    color: '#016EEF',
   },
   searchInput: {
     flex: 1,
+    fontSize: 15,
+    color: FigmaTheme.colors.textPrimary,
+    paddingVertical: 0,
+    marginLeft: 14,
+  },
+  clearSearchPill: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#E2E8F0',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  clearSearchPillText: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748B',
+    marginTop: -1,
+  },
+  searchEmptyCenterBox: {
+    paddingVertical: 48,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  searchEmptyIconCircle: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#EFF6FF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  searchEmptyTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#0F172A',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  searchEmptySub: {
+    fontSize: 13,
+    color: '#64748B',
+    textAlign: 'center',
+    maxWidth: 280,
+    lineHeight: 18,
+    marginBottom: 20,
+  },
+  searchClearBtn: {
+    paddingHorizontal: 24,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: '#016EEF',
+    backgroundColor: '#FFFFFF',
+  },
+  searchClearBtnText: {
     fontSize: 14,
-    color: '#0f172a',
-    padding: 0,
+    fontWeight: '700',
+    color: '#016EEF',
   },
   clearSearchIcon: {
     fontSize: 14,
-    color: '#94a3b8',
-    paddingHorizontal: 4,
-    fontWeight: '700',
+    color: FigmaTheme.colors.textMuted,
+    padding: 4,
   },
-  storageCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 18,
-    padding: 16,
-    marginBottom: 20,
-    borderWidth: 1,
-    borderColor: '#f1f5f9',
-    elevation: 2,
-    shadowColor: '#64748b',
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 2 },
-  },
-  storageTopRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  storageIconBox: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
-    backgroundColor: '#dbeafe',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 12,
-  },
-  storageIcon: {
-    fontSize: 20,
-  },
-  storageTextBox: {
+
+  // Scroll Content
+  scrollBody: {
     flex: 1,
   },
-  storageLabel: {
-    fontSize: 12,
-    color: '#64748b',
-    fontWeight: '500',
+  scrollContent: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    gap: 16,
   },
-  storageUsedValue: {
-    fontSize: 16,
+
+  // 3. Hero Card with Folder Tab (Figma)
+  heroWrap: {
+    width: '100%',
+    paddingTop: 4,
+  },
+  heroTabRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    height: 13,
+    marginBottom: -1,
+    zIndex: 2,
+  },
+  heroTabBody: {
+    width: 104,
+    height: 13,
+    backgroundColor: FigmaTheme.colors.primary,
+    borderTopLeftRadius: 16,
+  },
+  heroTabSlope: {
+    width: 0,
+    height: 0,
+    borderBottomWidth: 13,
+    borderBottomColor: FigmaTheme.colors.primary,
+    borderRightWidth: 11,
+    borderRightColor: 'transparent',
+  },
+  heroCard: {
+    backgroundColor: FigmaTheme.colors.primary,
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 18,
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 18,
+    paddingHorizontal: 18,
+    paddingVertical: 18,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    ...FigmaTheme.shadows.floating,
+  },
+  heroLeft: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  heroTitle: {
+    fontSize: 19,
+    fontWeight: '800',
+    color: '#FFFFFF',
+    letterSpacing: -0.3,
+    marginBottom: 4,
+  },
+  heroSubtitle: {
+    fontSize: 12.5,
+    color: 'rgba(255, 255, 255, 0.90)',
+    marginBottom: 14,
+  },
+  formatPillsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  heroFormatPill: {
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.45)',
+    backgroundColor: 'rgba(255, 255, 255, 0.10)',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  heroFormatPillText: {
+    fontSize: 10.5,
     fontWeight: '700',
-    color: '#0f172a',
-    marginTop: 2,
+    color: '#FFFFFF',
+    letterSpacing: 0.3,
   },
-  storageProgressTrack: {
-    height: 7,
-    backgroundColor: '#e2e8f0',
-    borderRadius: 4,
-    overflow: 'hidden',
-    marginTop: 12,
-    marginBottom: 10,
+  heroActionBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 3,
   },
-  storageProgressFill: {
-    height: '100%',
-    backgroundColor: '#2563eb',
-    borderRadius: 4,
+
+  // 4. 4 Category Quick Buttons
+  categoryGrid: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+    paddingVertical: 4,
   },
-  cleanupRow: {
-    marginTop: 2,
+  categoryItem: {
+    flex: 1,
+    alignItems: 'center',
   },
-  cleanupText: {
-    fontSize: 13,
-    color: '#64748b',
+  categoryIconBox: {
+    width: 52,
+    height: 52,
+    borderRadius: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 8,
   },
-  cleanupAction: {
-    color: '#2563eb',
+  categoryIconEmoji: {
+    fontSize: 22,
+  },
+  categoryLabel: {
+    fontSize: 12,
     fontWeight: '600',
+    color: '#0F172A',
   },
-  categoriesSection: {
-    marginBottom: 20,
+
+  // Section Headers
+  sectionContainer: {
+    gap: 10,
   },
   sectionHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 12,
+    paddingHorizontal: 4,
   },
   sectionTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#0f172a',
+    fontSize: 16,
+    fontWeight: '800',
+    color: FigmaTheme.colors.textPrimary,
   },
-  resetFilterText: {
+  seeAllLink: {
     fontSize: 13,
-    color: '#2563eb',
+    fontWeight: '700',
+    color: FigmaTheme.colors.primary,
+  },
+
+  // Continue Reading Card
+  continueSectionTitle: {
+    fontSize: 13,
     fontWeight: '600',
+    color: '#64748B',
   },
-  categoriesGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    rowGap: 10,
-  },
-  categoryCard: {
-    width: '48.5%',
-    backgroundColor: '#ffffff',
-    borderRadius: 14,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
+  continueCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 14,
     flexDirection: 'row',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#f1f5f9',
-    elevation: 1,
-    shadowColor: '#000',
-    shadowOpacity: 0.03,
-    shadowRadius: 3,
-    shadowOffset: { width: 0, height: 1 },
+    borderColor: FigmaTheme.colors.cardBorder,
+    ...FigmaTheme.shadows.card,
   },
-  categoryCardSelected: {
-    borderColor: '#2563eb',
-    backgroundColor: '#eff6ff',
-  },
-  categoryBadge: {
-    width: 42,
-    height: 42,
-    borderRadius: 10,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 10,
-  },
-  categoryBadgeText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '900',
-  },
-  categoryBadgeIconText: {
-    fontSize: 18,
-  },
-  categoryInfo: {
+  continueInfo: {
     flex: 1,
+    marginHorizontal: 12,
   },
-  categoryName: {
+  continueName: {
     fontSize: 14,
     fontWeight: '700',
-    color: '#0f172a',
+    color: FigmaTheme.colors.textPrimary,
+    marginBottom: 3,
   },
-  categoryCount: {
+  continueMeta: {
     fontSize: 12,
-    color: '#64748b',
-    marginTop: 2,
+    color: FigmaTheme.colors.textSecondary,
   },
-  recentSection: {
-    marginBottom: 20,
-  },
-  seeAllText: {
-    fontSize: 13,
+  continueProgressText: {
+    color: FigmaTheme.colors.primary,
     fontWeight: '600',
-    color: '#2563eb',
   },
-  clearRecentsText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#94a3b8',
-  },
-  recentFilesCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#f1f5f9',
+  continueProgressLineTrack: {
+    height: 4,
+    width: '100%',
+    backgroundColor: '#E2E8F0',
+    borderRadius: 2,
+    marginTop: 6,
     overflow: 'hidden',
-    elevation: 1,
-    shadowColor: '#000',
-    shadowOpacity: 0.03,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 1 },
   },
-  recentItemRow: {
+  continueProgressLineFill: {
+    height: '100%',
+    backgroundColor: '#016EEF',
+    borderRadius: 2,
+  },
+  continueArrow: {
+    fontSize: 16,
+    color: FigmaTheme.colors.primary,
+    fontWeight: '700',
+  },
+
+  // 6. Recent Files Card & List
+  recentFilesListCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: FigmaTheme.colors.cardBorder,
+    overflow: 'hidden',
+    ...FigmaTheme.shadows.card,
+  },
+  recentRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     paddingVertical: 12,
     paddingHorizontal: 14,
   },
-  recentItemDivider: {
+  recentRowDivider: {
     borderBottomWidth: 1,
-    borderBottomColor: '#f1f5f9',
+    borderBottomColor: FigmaTheme.colors.divider,
   },
+  recentRowContent: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 8,
+  },
+  recentMetaBox: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  recentFileName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: FigmaTheme.colors.textPrimary,
+    marginBottom: 3,
+  },
+  recentFileSub: {
+    fontSize: 12,
+    color: FigmaTheme.colors.textSecondary,
+  },
+  moreActionBtn: {
+    padding: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  moreActionDots: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: FigmaTheme.colors.textSecondary,
+  },
+
+  // Format Badge
   fileBadge: {
-    width: 38,
-    height: 38,
-    borderRadius: 8,
+    width: 44,
+    height: 44,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fileBadgeText: {
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  // Empty Recent Files (Figma Image 2: Home — first launch...)
+  emptyContainer: {
+    width: '100%',
+  },
+  emptyDashedBox: {
+    backgroundColor: '#FAFCFF',
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#38BDF8',
+    borderStyle: 'dashed',
+    padding: 16,
+  },
+  emptyTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 14,
+  },
+  emptyTextCol: {
+    flex: 1,
+  },
+  emptyTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#0F172A',
+    marginBottom: 2,
+  },
+  emptySubtitle: {
+    fontSize: 12.5,
+    color: '#64748B',
+  },
+  emptyStepsBox: {
+    backgroundColor: '#F1F5F9',
+    borderRadius: 12,
+    padding: 12,
+    gap: 12,
+    marginBottom: 14,
+  },
+  emptyStepRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  emptyStepNumCircle: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#E0F2FE',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 1,
+  },
+  emptyStepNum: {
+    fontSize: 11.5,
+    fontWeight: '800',
+    color: '#016EEF',
+  },
+  emptyStepText: {
+    flex: 1,
+    fontSize: 12.5,
+    lineHeight: 18,
+    color: '#334155',
+  },
+  emptyStepBold: {
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  browseDeviceBtn: {
+    width: '100%',
+    height: 40,
+    backgroundColor: '#016EEF',
+    borderRadius: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  browseDeviceBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  emptyFootnoteDivider: {
+    height: 1,
+    backgroundColor: '#E2E8F0',
+    width: '100%',
+    marginTop: 14,
+    marginBottom: 10,
+  },
+  emptyFooterNote: {
+    fontSize: 12,
+    color: '#64748B',
+    textAlign: 'center',
+  },
+
+  // 7. Internal Storage Card (Figma Screen 2 & 3)
+  storageCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  storageHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  storageHeaderLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  storageTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  storageAvailableText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#64748B',
+  },
+  storageProgressBarTrack: {
+    flexDirection: 'row',
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#E2E8F0',
+    overflow: 'hidden',
+    marginBottom: 10,
+  },
+  storageSegmentMedia: {
+    backgroundColor: '#016EEF',
+  },
+  storageSegmentDocs: {
+    backgroundColor: '#86EFAC',
+  },
+  storageSegmentOther: {
+    backgroundColor: '#475569',
+  },
+  storageSegmentFree: {
+    backgroundColor: 'transparent',
+  },
+  storageNumbersRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  storageUsedText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#64748B',
+  },
+  storageTotalText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#64748B',
+  },
+  storageLegendRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 2,
+  },
+  legendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  legendDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  legendText: {
+    fontSize: 11.5,
+    color: '#475569',
+    fontWeight: '500',
+  },
+
+  // 8. Sponsored Banner Card
+  sponsorCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: FigmaTheme.colors.cardBorder,
+    ...FigmaTheme.shadows.card,
+  },
+  sponsorTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  sponsorBadge: {
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  sponsorBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: FigmaTheme.colors.textSecondary,
+  },
+  sponsorRightTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  whyThisAdText: {
+    fontSize: 11,
+    color: FigmaTheme.colors.textMuted,
+  },
+  sponsorCloseIcon: {
+    fontSize: 13,
+    color: FigmaTheme.colors.textMuted,
+  },
+  sponsorContentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  sponsorAppIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#F3E8FF',
     justifyContent: 'center',
     alignItems: 'center',
     marginRight: 12,
   },
-  fileBadgeText: {
-    color: '#ffffff',
-    fontSize: 11,
-    fontWeight: '900',
-  },
-  fileBadgeIconText: {
-    fontSize: 16,
-  },
-  fileInfo: {
-    flex: 1,
-    marginRight: 8,
-  },
-  fileName: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#0f172a',
-  },
-  fileMeta: {
-    fontSize: 12,
-    color: '#64748b',
-    marginTop: 2,
-  },
-  starActionBtn: {
-    padding: 6,
-  },
-  starActionText: {
-    fontSize: 18,
-    color: '#cbd5e1',
-  },
-  starActive: {
-    color: '#f59e0b',
-  },
-  loadingBox: {
-    paddingVertical: 24,
-    alignItems: 'center',
-  },
-  loadingText: {
-    marginTop: 8,
-    fontSize: 12,
-    color: '#64748b',
-  },
-  emptyRecentCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 16,
-    padding: 24,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#f1f5f9',
-    elevation: 1,
-  },
-  emptyRecentIcon: {
-    fontSize: 32,
-    marginBottom: 8,
-  },
-  emptyRecentTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#0f172a',
-    marginBottom: 4,
-  },
-  emptyRecentSub: {
-    fontSize: 12,
-    color: '#64748b',
-    textAlign: 'center',
-    lineHeight: 18,
-    paddingHorizontal: 16,
-  },
-  continueSection: {
-    marginBottom: 20,
-  },
-  continueSub: {
-    fontSize: 11,
-    color: '#64748b',
-  },
-  continueScroll: {
-    gap: 10,
-    paddingVertical: 2,
-  },
-  continueCard: {
-    width: 170,
-    backgroundColor: '#ffffff',
-    borderRadius: 14,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: '#f1f5f9',
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOpacity: 0.04,
-    shadowRadius: 4,
-  },
-  continueCardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 6,
-  },
-  miniBadge: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  miniBadgeText: {
-    fontSize: 9,
-    fontWeight: '800',
-    color: '#ffffff',
-  },
-  continueProgress: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: '#16a34a',
-  },
-  continueFileName: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#0f172a',
-    lineHeight: 16,
-    marginBottom: 8,
-  },
-  continueFooter: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-  },
-  continueResumeText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#2563eb',
-  },
-  quickActionRow: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 4,
-  },
-  quickActionBtnPrimary: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#eff6ff',
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#bfdbfe',
-  },
-  quickActionBtnSecondary: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#ffffff',
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  quickActionIcon: {
-    fontSize: 20,
-    marginRight: 8,
-  },
-  quickActionIconSecondary: {
-    fontSize: 20,
-    marginRight: 8,
-  },
-  quickActionTitlePrimary: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#1e40af',
-  },
-  quickActionSubPrimary: {
-    fontSize: 10,
-    color: '#3b82f6',
-  },
-  quickActionTitleSecondary: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#334155',
-  },
-  quickActionSubSecondary: {
-    fontSize: 10,
-    color: '#64748b',
-  },
-  cleanModalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 24,
-  },
-  cleanModalCard: {
-    width: '100%',
-    maxWidth: 340,
-    backgroundColor: '#ffffff',
-    borderRadius: 20,
-    padding: 24,
-    alignItems: 'center',
-    elevation: 8,
-    shadowColor: '#000',
-    shadowOpacity: 0.15,
-    shadowRadius: 12,
-  },
-  cleanIconBox: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: '#eff6ff',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  cleanIconText: {
-    fontSize: 28,
-  },
-  cleanModalTitle: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: '#0f172a',
-    marginBottom: 8,
-  },
-  cleanModalDesc: {
-    fontSize: 13,
-    color: '#64748b',
-    textAlign: 'center',
-    lineHeight: 18,
-    marginBottom: 16,
-  },
-  cleanStatsRow: {
-    backgroundColor: '#f0fdf4',
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    marginBottom: 20,
-  },
-  cleanSavedText: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#16a34a',
-  },
-  cleanModalBtn: {
-    backgroundColor: '#2563eb',
-    width: '100%',
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  cleanModalBtnText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  permissionCard: {
-    backgroundColor: '#eff6ff',
-    borderRadius: 14,
-    padding: 14,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#bfdbfe',
-  },
-  permissionHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 10,
-    marginBottom: 10,
-  },
-  permissionIcon: {
+  sponsorAppIconText: {
     fontSize: 22,
   },
-  permissionTitle: {
+  sponsorTextBox: {
+    flex: 1,
+  },
+  sponsorHeadline: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: FigmaTheme.colors.textPrimary,
+    marginBottom: 3,
+  },
+  sponsorSubline: {
+    fontSize: 12,
+    color: FigmaTheme.colors.textSecondary,
+  },
+  sponsorCtaBtn: {
+    backgroundColor: '#EFF6FF',
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  sponsorCtaText: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#1e40af',
-  },
-  permissionDesc: {
-    fontSize: 11,
-    color: '#3b82f6',
-    marginTop: 2,
-    lineHeight: 16,
-  },
-  dismissText: {
-    fontSize: 14,
-    color: '#94a3b8',
-    padding: 4,
-  },
-  permissionBtnRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 4,
-  },
-  permActionBtn: {
-    backgroundColor: '#2563eb',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
-  permActionBtnText: {
-    color: '#ffffff',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  modalWrapper: {
-    flex: 1,
-    paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 0,
+    color: FigmaTheme.colors.primary,
   },
 });
+

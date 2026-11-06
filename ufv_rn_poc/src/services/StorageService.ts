@@ -95,6 +95,21 @@ export class StorageService {
     }
   }
 
+  async requestAllFilesAccess(): Promise<{ granted: boolean }> {
+    if (Platform.OS !== 'android' || !StorageModule) {
+      return { granted: false };
+    }
+    try {
+      if (typeof StorageModule.requestAllFilesAccess === 'function') {
+        return await StorageModule.requestAllFilesAccess();
+      }
+      return { granted: false };
+    } catch (err) {
+      console.warn('StorageService.requestAllFilesAccess failed', err);
+      return { granted: false };
+    }
+  }
+
   getCachedDashboardCounts(): DashboardCounts | null {
     try {
       const raw = MMKV.getString(DASHBOARD_COUNTS_CACHE_KEY);

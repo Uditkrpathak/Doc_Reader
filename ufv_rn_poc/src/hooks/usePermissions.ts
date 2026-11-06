@@ -13,17 +13,19 @@ export function usePermissions() {
 
   const storageService = StorageService.getInstance();
 
-  const refreshPermissions = useCallback(async () => {
+  const refreshPermissions = useCallback(async (): Promise<PermissionState> => {
     setIsLoading(true);
     try {
       const perms = await storageService.getPermissionState();
       setState(perms);
+      return perms;
     } catch (err) {
       console.warn('Failed to refresh permissions', err);
+      return state;
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [state, storageService]);
 
   useEffect(() => {
     refreshPermissions();
@@ -47,15 +49,29 @@ export function usePermissions() {
         await refreshPermissions();
         return granted;
       } else {
-        const res = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE
-        );
-        const granted = res === PermissionsAndroid.RESULTS.GRANTED;
+        const results = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
+          PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+        ]);
+        const granted =
+          results[PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE] === PermissionsAndroid.RESULTS.GRANTED ||
+          results[PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE] === PermissionsAndroid.RESULTS.GRANTED;
         await refreshPermissions();
         return granted;
       }
     } catch (err) {
       console.warn('requestMediaPermissions error', err);
+      return false;
+    }
+  };
+
+  const requestAllFilesAccess = async (): Promise<boolean> => {
+    try {
+      const res = await storageService.requestAllFilesAccess();
+      await refreshPermissions();
+      return Boolean(res.granted);
+    } catch (err) {
+      console.warn('requestAllFilesAccess error', err);
       return false;
     }
   };
@@ -71,12 +87,36 @@ export function usePermissions() {
     }
   };
 
+  const requestAutoPermissions = async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return true;
+    try {
+      // 1. Request Media / External Storage Runtime Permissions
+      await requestMediaPermissions();
+
+      // 2. Refresh permission state
+      const perms = await refreshPermissions();
+
+      // 3. For modern Android (Android 11+ / API 30+), request All Files Access if not yet granted
+      if (Platform.Version >= 30 && !perms.allFiles) {
+        await requestAllFilesAccess();
+      }
+
+      await refreshPermissions();
+      return true;
+    } catch (err) {
+      console.warn('requestAutoPermissions error', err);
+      return false;
+    }
+  };
+
   return {
     permissionState: state,
     isLoading,
     refreshPermissions,
     requestMediaPermissions,
+    requestAllFilesAccess,
     requestDocumentsTree,
+    requestAutoPermissions,
   };
 }
 

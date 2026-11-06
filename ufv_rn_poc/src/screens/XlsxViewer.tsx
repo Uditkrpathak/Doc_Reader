@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -6,14 +6,17 @@ import {
   FlatList,
   ScrollView,
   StyleSheet,
-  ActivityIndicator,
   SafeAreaView,
   StatusBar,
   TextInput,
+  Dimensions,
+  NativeModules,
+  Alert,
 } from 'react-native';
 import * as XLSX from 'xlsx';
 import { ArchiveEngine } from '../services/ArchiveEngine';
 import { PasswordModal } from '../components/PasswordModal';
+import { WarningTriangleIcon, InfoCircleIcon } from '../components/AppIcons';
 
 interface XlsxViewerProps {
   filePath: string;
@@ -33,6 +36,10 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
   const [dataRows, setDataRows] = useState<string[][]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [fileSizeStr, setFileSizeStr] = useState<string>('');
+  const [fileSizeBytes, setFileSizeBytes] = useState<number>(0);
+  const [loadingProgress, setLoadingProgress] = useState<number>(0);
+  const cancelLoadingRef = useRef<boolean>(false);
 
   // Zoom scale: 0.7 (70%), 1.0 (100%), 1.25 (125%), 1.5 (150%)
   const [zoom, setZoom] = useState<number>(1.0);
@@ -41,7 +48,7 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
 
-  // Selected Cell & Formula Bar
+  // Selected Cell & Floating Pill
   const [selectedCell, setSelectedCell] = useState<{
     row: number;
     col: number;
@@ -60,11 +67,23 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
   const lastTapRef = React.useRef<{ colIdx: number; time: number }>({ colIdx: -1, time: 0 });
 
   const engine = ArchiveEngine.getInstance();
-  const BASE_COL_WIDTH = 110;
+  const screenWidth = Dimensions.get('window').width;
   const BASE_ROW_HEIGHT = 38;
   const BASE_INDEX_WIDTH = 48;
 
-  const colWidth = Math.round(BASE_COL_WIDTH * zoom);
+  const activeSheetIndex = sheetNames.indexOf(activeSheet);
+  const sheetIndexDisplay = activeSheetIndex >= 0 ? activeSheetIndex + 1 : 1;
+
+  const adaptiveColWidth = useMemo(() => {
+    if (headers.length === 0) return 90;
+    const available = screenWidth - BASE_INDEX_WIDTH;
+    if (headers.length <= 4) {
+      return Math.floor(available / headers.length);
+    }
+    return Math.max(85, Math.min(160, Math.floor(available / Math.min(headers.length, 5))));
+  }, [headers.length, screenWidth]);
+
+  const colWidth = Math.round(adaptiveColWidth * zoom);
   const rowHeight = Math.round(BASE_ROW_HEIGHT * zoom);
   const indexWidth = Math.round(BASE_INDEX_WIDTH * zoom);
   const fontSize = Math.max(10, Math.round(13 * zoom));
@@ -75,7 +94,36 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
   };
 
   useEffect(() => {
+    let isMounted = true;
+    cancelLoadingRef.current = false;
+    setLoadingProgress(24);
+
+    NativeModules.ArchiveModule?.readFileHeader(filePath, 64)
+      .then((res: any) => {
+        if (!isMounted || !res || !res.size) return;
+        setFileSizeBytes(res.size);
+        const mb = res.size / (1024 * 1024);
+        if (mb >= 1) {
+          setFileSizeStr(`${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB`);
+        } else {
+          setFileSizeStr(`${Math.max(1, Math.round(res.size / 1024))} KB`);
+        }
+      })
+      .catch(() => {});
+
+    const timer = setInterval(() => {
+      setLoadingProgress((prev) => {
+        if (prev >= 92) return prev;
+        return prev + (prev < 60 ? 14 : 7);
+      });
+    }, 200);
+
     loadWorkbook();
+
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
+    };
   }, [filePath]);
 
   const loadWorkbook = async (password?: string) => {
@@ -85,6 +133,8 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
 
     try {
       const b64 = await engine.readFileBase64(filePath);
+      if (cancelLoadingRef.current) return;
+
       const readOptions: XLSX.ParsingOptions = {
         type: 'base64',
         cellDates: true,
@@ -94,6 +144,7 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
       }
 
       const wb = XLSX.read(b64, readOptions);
+      if (cancelLoadingRef.current) return;
 
       setWorkbook(wb);
       setSheetNames(wb.SheetNames || []);
@@ -107,6 +158,7 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
         setErrorMsg('Workbook contains no readable sheets.');
       }
     } catch (err: any) {
+      if (cancelLoadingRef.current) return;
       const msg = err.message || String(err);
       if (
         msg.toLowerCase().includes('password') ||
@@ -121,7 +173,9 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
         setErrorMsg(`Failed to open workbook: ${msg}`);
       }
     } finally {
-      setIsLoading(false);
+      if (!cancelLoadingRef.current) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -152,11 +206,20 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
       );
 
       const generatedHeaders: string[] = [];
+      const computedWidths: Record<number, number> = {};
       for (let i = 0; i < maxCols; i++) {
         const colLetter = getColumnLetter(i);
         generatedHeaders.push(colLetter);
+
+        let maxLen = 4;
+        for (let r = 0; r < Math.min(rawRows.length, 60); r++) {
+          const val = String(rawRows[r]?.[i] || '');
+          if (val.length > maxLen) maxLen = Math.min(val.length, 45);
+        }
+        computedWidths[i] = Math.max(85, Math.min(320, Math.round(maxLen * 8.5 + 24)));
       }
 
+      setColWidths(computedWidths);
       setHeaders(generatedHeaders);
       setDataRows(rawRows);
     } catch (err: any) {
@@ -181,18 +244,6 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
     }
   };
 
-  const handleZoomIn = () => {
-    setZoom((prev) => Math.min(2.0, +(prev + 0.2).toFixed(1)));
-  };
-
-  const handleZoomOut = () => {
-    setZoom((prev) => Math.max(0.6, +(prev - 0.2).toFixed(1)));
-  };
-
-  const handleResetZoom = () => {
-    setZoom(1.0);
-  };
-
   const handleShare = async () => {
     try {
       await engine.shareFile(
@@ -202,6 +253,28 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
     } catch (err) {
       console.warn('Share error', err);
     }
+  };
+
+  const handleActionMenu = () => {
+    Alert.alert(
+      fileName,
+      'Choose an action',
+      [
+        {
+          text: isSearchOpen ? 'Hide Search' : 'Find in Sheet',
+          onPress: () => setIsSearchOpen(!isSearchOpen),
+        },
+        {
+          text: 'Share Spreadsheet',
+          onPress: handleShare,
+        },
+        {
+          text: 'Reset Zoom (100%)',
+          onPress: () => setZoom(1.0),
+        },
+        { text: 'Cancel', style: 'cancel' },
+      ]
+    );
   };
 
   // Filter or highlight matching rows
@@ -320,192 +393,244 @@ export const XlsxViewer: React.FC<XlsxViewerProps> = ({
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#107c41" />
+      <StatusBar hidden={true} />
 
-      {/* Top App Header */}
+      {/* Top App Header (Figma Blue #016EEF) */}
       <View style={styles.header}>
+        <TouchableOpacity style={styles.backBtn} onPress={onClose} activeOpacity={0.7}>
+          <Text style={styles.backBtnText}>‹</Text>
+        </TouchableOpacity>
+
         <View style={styles.headerLeft}>
           <Text style={styles.title} numberOfLines={1}>
-            📊 {fileName}
+            {fileName}
           </Text>
           <Text style={styles.subtitle}>
-            {dataRows.length.toLocaleString()} rows • {headers.length} columns
+            {isLoading || errorMsg
+              ? `XLSX${fileSizeStr ? ` · ${fileSizeStr}` : ''}`
+              : `XLSX${fileSizeStr ? ` · ${fileSizeStr}` : ''}${sheetNames.length > 0 ? ` · Sheet ${sheetIndexDisplay} of ${sheetNames.length}` : ''}`}
           </Text>
         </View>
 
         <View style={styles.headerRight}>
-          <TouchableOpacity style={styles.shareBtn} onPress={handleShare} activeOpacity={0.7}>
-            <Text style={styles.shareBtnText}>📤 Share</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.searchToggleBtn}
-            onPress={() => setIsSearchOpen(!isSearchOpen)}>
-            <Text style={styles.searchIcon}>{isSearchOpen ? '✕' : '🔍'}</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={styles.closeBtn} onPress={onClose}>
-            <Text style={styles.closeBtnText}>✕ Close</Text>
+          <TouchableOpacity style={styles.actionMenuBtn} onPress={handleActionMenu} activeOpacity={0.7}>
+            <Text style={styles.actionMenuDots}>⋮</Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      {/* Search Bar (Collapsible) */}
-      {isSearchOpen && (
-        <View style={styles.searchBar}>
-          <Text style={styles.searchBarIcon}>🔍</Text>
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search cells in this sheet..."
-            placeholderTextColor="#94a3b8"
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            autoFocus
-            clearButtonMode="while-editing"
-          />
-          {searchQuery.length > 0 && (
-            <TouchableOpacity
-              onPress={() => setSearchQuery('')}
-              style={styles.clearSearchBtn}>
-              <Text style={styles.clearSearchText}>✕</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      )}
-
-      {/* Excel Toolbar: Zoom & Sheets */}
-      <View style={styles.toolbar}>
-        {/* Zoom Controls */}
-        <View style={styles.zoomGroup}>
-          <TouchableOpacity
-            style={styles.zoomBtn}
-            onPress={handleZoomOut}
-            disabled={zoom <= 0.6}>
-            <Text style={styles.zoomBtnText}>−</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={handleResetZoom}>
-            <Text style={styles.zoomLabel}>{Math.round(zoom * 100)}%</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.zoomBtn}
-            onPress={handleZoomIn}
-            disabled={zoom >= 2.0}>
-            <Text style={styles.zoomBtnText}>+</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Sheet Selector Tabs */}
-        {sheetNames.length > 1 && (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.sheetTabsScroll}>
-            {sheetNames.map((name) => (
-              <TouchableOpacity
-                key={name}
-                style={[
-                  styles.sheetTab,
-                  activeSheet === name && styles.sheetTabActive,
-                ]}
-                onPress={() => handleSheetChange(name)}>
-                <Text
-                  style={[
-                    styles.sheetTabText,
-                    activeSheet === name && styles.sheetTabTextActive,
-                  ]}>
-                  {name}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        )}
-      </View>
-
-      {/* Excel Cell Formula Bar */}
-      <View style={styles.formulaBar}>
-        <View style={styles.cellAddressBox}>
-          <Text style={styles.cellAddressText}>
-            {selectedCell ? selectedCell.address : 'A1'}
-          </Text>
-        </View>
-        <Text style={styles.fxSymbol}>fx</Text>
-        <View style={styles.formulaInputBox}>
-          <Text style={styles.formulaText} numberOfLines={1}>
-            {selectedCell ? selectedCell.value : dataRows[0]?.[0] || '(Tap any cell to inspect value)'}
-          </Text>
-        </View>
-      </View>
-
-      {/* Main Grid Content */}
+      {/* Main Content Area */}
       {isLoading ? (
-        <View style={styles.centerBox}>
-          <ActivityIndicator size="large" color="#107c41" />
-          <Text style={styles.loadingText}>Opening Excel Workbook...</Text>
-        </View>
-      ) : errorMsg ? (
-        <View style={styles.centerBox}>
-          <View style={styles.errorCard}>
-            <Text style={styles.errorIcon}>⚠️</Text>
-            <Text style={styles.errorTitle}>Error Opening File</Text>
-            <Text style={styles.errorDesc}>{errorMsg}</Text>
-          </View>
-        </View>
-      ) : (
-        <ScrollView horizontal style={styles.horizontalScroll}>
-          <View style={{ width: totalGridWidth }}>
-            {/* Sticky Header Row with Column Letters */}
-            <View style={[styles.headerRow, { height: rowHeight }]}>
-              {/* Top-left empty corner */}
-              <View
-                style={[
-                  styles.cornerCell,
-                  { width: indexWidth, height: rowHeight },
-                ]}>
-                <Text style={styles.cornerText}>#</Text>
-              </View>
-
-              {/* Column Letter Badges */}
-              {headers.map((h, i) => (
-                <TouchableOpacity
-                  key={i}
-                  activeOpacity={0.7}
-                  onPress={() => handleHeaderTap(i)}
-                  style={[
-                    styles.headerCell,
-                    { width: getColWidth(i), height: rowHeight },
-                    sortCol === i && styles.headerCellSorted,
-                  ]}>
-                  <View style={styles.headerCellContent}>
-                    <Text
-                      style={[styles.headerCellText, { fontSize: headerFontSize }]}
-                      numberOfLines={1}>
-                      {h}
-                    </Text>
-                    {sortCol === i && (
-                      <Text style={styles.sortArrow}>{sortOrder === 'ASC' ? '▲' : '▼'}</Text>
-                    )}
-                  </View>
-                </TouchableOpacity>
+        /* FIGMA SCREEN 4: SPREADSHEET — LARGE SPREADSHEET OPENING */
+        <View style={styles.loadingContainer}>
+          {/* Card 1: 5-Column Skeleton Grid Card */}
+          <View style={styles.skeletonCard}>
+            {/* Header row pills */}
+            <View style={styles.skeletonHeaderRow}>
+              {[50, 64, 48, 58, 52].map((w, i) => (
+                <View key={i} style={[styles.skeletonHeaderPill, { width: w }]} />
               ))}
             </View>
-
-            {/* Virtualized Rows List */}
-            <FlatList
-              data={dataRows}
-              keyExtractor={(_, index) => `row-${index}`}
-              renderItem={renderRow}
-              initialNumToRender={35}
-              maxToRenderPerBatch={30}
-              windowSize={11}
-              removeClippedSubviews={true}
-              getItemLayout={(_, index) => ({
-                length: rowHeight,
-                offset: rowHeight * index,
-                index,
-              })}
-            />
+            {/* 5 data row pills */}
+            {[0, 1, 2, 3, 4].map((rowIndex) => (
+              <View key={rowIndex} style={styles.skeletonDataRow}>
+                {[44, 58, 46, 52, 48].map((w, colIndex) => (
+                  <View
+                    key={colIndex}
+                    style={[
+                      styles.skeletonCellPill,
+                      { width: colIndex === 0 ? 36 : w + ((rowIndex + colIndex) % 3) * 6 },
+                    ]}
+                  />
+                ))}
+              </View>
+            ))}
           </View>
-        </ScrollView>
+
+          {/* Card 2: Loading Status Card */}
+          <View style={styles.loadingProgressCard}>
+            <Text style={styles.loadingTitle}>
+              {fileSizeBytes > 2 * 1024 * 1024 ? 'Opening large spreadsheet...' : 'Opening spreadsheet...'}
+            </Text>
+            <Text style={styles.loadingSubtitle}>
+              {dataRows.length > 0
+                ? `Loaded ${dataRows.length.toLocaleString()} rows. You can leave and come back; nothing is lost.`
+                : `Reading spreadsheet data${fileSizeStr ? ` (${fileSizeStr})` : ''}... You can leave and come back; nothing is lost.`}
+            </Text>
+
+            <View style={styles.progressBarTrack}>
+              <View style={[styles.progressBarFill, { width: `${loadingProgress}%` }]} />
+            </View>
+
+            <TouchableOpacity
+              style={styles.loadingCancelBtn}
+              activeOpacity={0.8}
+              onPress={() => {
+                cancelLoadingRef.current = true;
+                onClose();
+              }}>
+              <Text style={styles.loadingCancelBtnText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : errorMsg ? (
+        /* FIGMA SCREEN 1/4: CANNOT DISPLAY SPREADSHEET ERROR STATE */
+        <View style={styles.errorContainer}>
+          <View style={styles.errorIconCircle}>
+            <WarningTriangleIcon size={30} color="#EA580C" innerColor="#FFF7ED" />
+          </View>
+          <Text style={styles.errorHeading}>Some content can't be shown</Text>
+          <Text style={styles.errorSubheading}>
+            This spreadsheet uses features that aren't supported here. You can still share the original file.
+          </Text>
+
+          <TouchableOpacity
+            style={styles.errorShareBtn}
+            activeOpacity={0.8}
+            onPress={handleShare}>
+            <Text style={styles.errorShareBtnText}>Share file</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.errorBackBtn}
+            activeOpacity={0.8}
+            onPress={onClose}>
+            <Text style={styles.errorBackBtnText}>Back to files</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        /* FIGMA SCREEN 3 & 5: SPREADSHEET VIEWER */
+        <View style={{ flex: 1, backgroundColor: '#FFFFFF' }}>
+          {/* Search Bar (Collapsible) */}
+          {isSearchOpen && (
+            <View style={styles.searchBar}>
+              <Text style={styles.searchBarIcon}>🔍</Text>
+              <TextInput
+                style={styles.searchInput}
+                placeholder="Search cells in this sheet..."
+                placeholderTextColor="#94a3b8"
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                autoFocus
+                clearButtonMode="while-editing"
+              />
+              {searchQuery.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setSearchQuery('')}
+                  style={styles.clearSearchBtn}>
+                  <Text style={styles.clearSearchText}>✕</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+
+          <ScrollView
+            horizontal
+            style={styles.horizontalScroll}
+            contentContainerStyle={{ flexGrow: 1 }}
+            showsHorizontalScrollIndicator={true}>
+            <View style={{ width: Math.max(screenWidth, totalGridWidth), flex: 1 }}>
+              {/* Sticky Header Row with Column Letters A, B, C, D */}
+              <View style={[styles.headerRow, { height: rowHeight }]}>
+                {/* Top-left empty corner */}
+                <View
+                  style={[
+                    styles.cornerCell,
+                    { width: indexWidth, height: rowHeight },
+                  ]}>
+                  <Text style={styles.cornerText}>#</Text>
+                </View>
+
+                {/* Column Letter Badges */}
+                {headers.map((h, i) => (
+                  <TouchableOpacity
+                    key={i}
+                    activeOpacity={0.7}
+                    onPress={() => handleHeaderTap(i)}
+                    style={[
+                      styles.headerCell,
+                      { width: getColWidth(i), height: rowHeight },
+                      sortCol === i && styles.headerCellSorted,
+                    ]}>
+                    <View style={styles.headerCellContent}>
+                      <Text
+                        style={[styles.headerCellText, { fontSize: headerFontSize }]}
+                        numberOfLines={1}>
+                        {h}
+                      </Text>
+                      {sortCol === i && (
+                        <Text style={styles.sortArrow}>{sortOrder === 'ASC' ? '▲' : '▼'}</Text>
+                      )}
+                    </View>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Virtualized Rows List */}
+              <FlatList
+                data={dataRows}
+                keyExtractor={(_, index) => `row-${index}`}
+                renderItem={renderRow}
+                initialNumToRender={35}
+                maxToRenderPerBatch={30}
+                windowSize={11}
+                removeClippedSubviews={true}
+                getItemLayout={(_, index) => ({
+                  length: rowHeight,
+                  offset: rowHeight * index,
+                  index,
+                })}
+              />
+            </View>
+          </ScrollView>
+
+          {/* Figma Screen 3 & 5: Floating Deep Navy Pill (#0D084C) */}
+          {selectedCell && (
+            <View style={styles.floatingNavyPillContainer} pointerEvents="box-none">
+              <View style={styles.floatingNavyPill}>
+                <Text style={styles.floatingPillAddress}>{selectedCell.address}</Text>
+                <Text style={styles.floatingPillValue}>{selectedCell.value}</Text>
+              </View>
+            </View>
+          )}
+
+          {/* Figma Screen 5: Format Notice Banner */}
+          <View style={styles.figmaNoticeBanner}>
+            <InfoCircleIcon size={14} color="#016EEF" />
+            <Text style={styles.figmaNoticeText}>
+              Charts and macros aren't shown. Cell values are.
+            </Text>
+          </View>
+
+          {/* Figma Screen 3 & 5: Bottom Sheet Tabs (Summary, Q1, Q2, Forecast) */}
+          {sheetNames.length > 0 && (
+            <View style={styles.bottomSheetTabsBar}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.bottomSheetTabsScroll}>
+                {sheetNames.map((name) => (
+                  <TouchableOpacity
+                    key={name}
+                    style={[
+                      styles.bottomSheetPill,
+                      activeSheet === name && styles.bottomSheetPillActive,
+                    ]}
+                    onPress={() => handleSheetChange(name)}
+                    activeOpacity={0.7}>
+                    <Text
+                      style={[
+                        styles.bottomSheetPillText,
+                        activeSheet === name && styles.bottomSheetPillTextActive,
+                      ]}>
+                      {name}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
+          )}
+        </View>
       )}
 
       {/* Password Modal */}
@@ -533,9 +658,23 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: '#107c41',
+    backgroundColor: '#016EEF',
     paddingHorizontal: 14,
     paddingVertical: 10,
+  },
+  backBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 10,
+  },
+  backBtnText: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
   headerLeft: {
     flex: 1,
@@ -547,9 +686,10 @@ const styles = StyleSheet.create({
     color: '#ffffff',
   },
   subtitle: {
-    fontSize: 11,
-    color: '#e2f0d9',
+    fontSize: 12,
+    color: 'rgba(255, 255, 255, 0.85)',
     marginTop: 2,
+    fontWeight: '500',
   },
   headerRight: {
     flexDirection: 'row',
@@ -557,7 +697,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   shareBtn: {
-    backgroundColor: '#056230',
+    backgroundColor: '#016EEF',
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 6,
@@ -578,7 +718,7 @@ const styles = StyleSheet.create({
     color: '#ffffff',
   },
   closeBtn: {
-    backgroundColor: '#0d6535',
+    backgroundColor: '#016EEF',
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 6,
@@ -641,7 +781,7 @@ const styles = StyleSheet.create({
   zoomBtnText: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#107c41',
+    color: '#016EEF',
   },
   zoomLabel: {
     fontSize: 12,
@@ -660,7 +800,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#e2e8f0',
   },
   sheetTabActive: {
-    backgroundColor: '#107c41',
+    backgroundColor: '#016EEF',
   },
   sheetTabText: {
     fontSize: 12,
@@ -749,7 +889,7 @@ const styles = StyleSheet.create({
   cellAddressText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#107c41',
+    color: '#016EEF',
   },
   fxSymbol: {
     fontSize: 14,
@@ -772,12 +912,12 @@ const styles = StyleSheet.create({
   },
   selectedCell: {
     borderWidth: 2,
-    borderColor: '#107c41',
-    backgroundColor: '#ecfdf5',
+    borderColor: '#016EEF',
+    backgroundColor: '#EFF6FF',
     zIndex: 2,
   },
   selectedCellText: {
-    color: '#065f46',
+    color: '#016EEF',
     fontWeight: '700',
   },
   dataCell: {
@@ -843,10 +983,258 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   headerCellSorted: {
-    backgroundColor: '#0c5c30',
+    backgroundColor: '#016EEF',
   },
   sortArrow: {
     fontSize: 9,
     color: '#ffffff',
+  },
+  floatingNavyPillContainer: {
+    position: 'absolute',
+    bottom: 84,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 99,
+  },
+  floatingNavyPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0D084C',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 24,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+    gap: 12,
+  },
+  floatingPillAddress: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#FFFFFF',
+    letterSpacing: 0.5,
+  },
+  floatingPillValue: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#FFFFFF',
+  },
+  figmaNoticeBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EFF6FF',
+    borderTopWidth: 1,
+    borderTopColor: '#DBEAFE',
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    gap: 8,
+  },
+  figmaNoticeIcon: {
+    fontSize: 12,
+    marginRight: 4,
+  },
+  figmaNoticeText: {
+    fontSize: 12.5,
+    color: '#1E40AF',
+    fontWeight: '500',
+    flex: 1,
+  },
+  bottomSheetTabsBar: {
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: 1,
+    borderTopColor: '#E2E8F0',
+    paddingVertical: 8,
+  },
+  bottomSheetTabsScroll: {
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  bottomSheetPill: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: '#F1F5F9',
+  },
+  bottomSheetPillActive: {
+    backgroundColor: '#016EEF',
+  },
+  bottomSheetPillText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  bottomSheetPillTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  actionMenuBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  actionMenuDots: {
+    color: '#0F172A',
+    fontSize: 18,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: '#F8FAFC',
+    padding: 16,
+  },
+  skeletonCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#F1F5F9',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+  },
+  skeletonHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingBottom: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  skeletonHeaderPill: {
+    height: 14,
+    backgroundColor: '#CBD5E1',
+    borderRadius: 7,
+  },
+  skeletonDataRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F8FAFC',
+  },
+  skeletonCellPill: {
+    height: 12,
+    backgroundColor: '#E2E8F0',
+    borderRadius: 6,
+  },
+  loadingProgressCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 20,
+    marginTop: 16,
+    borderWidth: 1,
+    borderColor: '#F1F5F9',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+  },
+  loadingTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  loadingSubtitle: {
+    fontSize: 13,
+    color: '#64748B',
+    marginTop: 6,
+  },
+  progressBarTrack: {
+    height: 6,
+    backgroundColor: '#E2E8F0',
+    borderRadius: 3,
+    marginTop: 14,
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: 6,
+    backgroundColor: '#016EEF',
+    borderRadius: 3,
+  },
+  loadingCancelBtn: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: '#016EEF',
+    borderRadius: 10,
+    height: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadingCancelBtnText: {
+    color: '#016EEF',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  errorContainer: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  errorIconCircle: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#FFF7ED',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 18,
+  },
+  errorHeading: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#0F172A',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  errorSubheading: {
+    fontSize: 13.5,
+    color: '#64748B',
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 28,
+    maxWidth: 280,
+  },
+  errorShareBtn: {
+    backgroundColor: '#016EEF',
+    height: 48,
+    borderRadius: 12,
+    width: '100%',
+    maxWidth: 280,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  errorShareBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  errorBackBtn: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: '#016EEF',
+    height: 48,
+    borderRadius: 12,
+    width: '100%',
+    maxWidth: 280,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  errorBackBtnText: {
+    color: '#016EEF',
+    fontSize: 15,
+    fontWeight: '700',
   },
 });

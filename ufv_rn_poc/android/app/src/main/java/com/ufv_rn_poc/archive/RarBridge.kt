@@ -1,5 +1,6 @@
 package com.ufv_rn_poc.archive
 
+import android.net.Uri
 import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -7,6 +8,7 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import java.io.File
+import java.io.FileOutputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -46,6 +48,39 @@ class RarBridge(private val reactContext: ReactApplicationContext) : ReactContex
         @JvmStatic external fun nativeExtractSingle(archivePath: String, entryName: String, destDir: String): String
     }
 
+    private fun resolveFile(path: String): File {
+        if (path.startsWith("content://")) {
+            val uri = Uri.parse(path)
+            var displayName = "shared_rar_${System.currentTimeMillis()}.rar"
+            val resolver = (currentActivity ?: reactContext).contentResolver
+            try {
+                resolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0 && cursor.moveToFirst()) {
+                        val name = cursor.getString(nameIdx)
+                        if (!name.isNullOrBlank()) {
+                            displayName = name
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+            val incomingDir = File(reactContext.cacheDir, "incoming")
+            if (!incomingDir.exists()) incomingDir.mkdirs()
+            val destFile = File(incomingDir, displayName)
+            if (destFile.exists() && destFile.length() > 0 && (System.currentTimeMillis() - destFile.lastModified() < 60000)) {
+                return destFile
+            }
+            resolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(destFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            return destFile
+        }
+        val cleanPath = if (path.startsWith("file://")) path.substring(7) else path
+        return File(cleanPath)
+    }
+
     @ReactMethod
     fun listRarContents(path: String, promise: Promise) {
         CoroutineScope(Dispatchers.IO).launch {
@@ -54,13 +89,12 @@ class RarBridge(private val reactContext: ReactApplicationContext) : ReactContex
                     promise.reject("RAR_UNAVAILABLE", "Native unrar engine is not available on this device")
                     return@launch
                 }
-                val cleanPath = if (path.startsWith("file://")) path.substring(7) else path
-                val file = File(cleanPath)
+                val file = resolveFile(path)
                 if (!file.exists()) {
-                    promise.reject("FILE_NOT_FOUND", "RAR file does not exist: $cleanPath")
+                    promise.reject("FILE_NOT_FOUND", "RAR file does not exist: ${file.absolutePath}")
                     return@launch
                 }
-                val list = nativeListRar(cleanPath)
+                val list = nativeListRar(file.absolutePath)
                 if (list.size == 1 && list[0].startsWith("ERROR:")) {
                     if (list[0].contains("PASSWORD_REQUIRED")) {
                         promise.reject("PASSWORD_REQUIRED", "Archive is password-protected")
@@ -88,10 +122,9 @@ class RarBridge(private val reactContext: ReactApplicationContext) : ReactContex
                     promise.reject("RAR_UNAVAILABLE", "Native unrar engine is not available on this device")
                     return@launch
                 }
-                val cleanPath = if (rarPath.startsWith("file://")) rarPath.substring(7) else rarPath
-                val file = File(cleanPath)
+                val file = resolveFile(rarPath)
                 if (!file.exists()) {
-                    promise.reject("FILE_NOT_FOUND", "RAR file does not exist: $cleanPath")
+                    promise.reject("FILE_NOT_FOUND", "RAR file does not exist: ${file.absolutePath}")
                     return@launch
                 }
                 val cacheDir = File(reactContext.cacheDir, "rar_extracted")
@@ -102,7 +135,7 @@ class RarBridge(private val reactContext: ReactApplicationContext) : ReactContex
                 val destFile = File(cacheDir, cleanEntry)
                 destFile.parentFile?.mkdirs()
 
-                val result = nativeExtractSingle(cleanPath, entryName, cacheDir.absolutePath)
+                val result = nativeExtractSingle(file.absolutePath, entryName, cacheDir.absolutePath)
                 if (result.startsWith("ERROR:")) {
                     promise.reject("RAR_EXTRACT_ERROR", result)
                 } else {

@@ -101,6 +101,10 @@ class AudioPlaybackService {
     await this.seek(target);
   }
 
+  public async setSpeed(speed: number): Promise<void> {
+    await this.engine.setAudioSpeed(speed);
+  }
+
   public async stop(): Promise<void> {
     this.stopPolling();
     await this.engine.stopAudio();

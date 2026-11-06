@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import {
   View,
   Text,
@@ -6,17 +6,26 @@ import {
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
-  ScrollView,
+  FlatList,
   Dimensions,
-  SafeAreaView,
   StatusBar,
   Modal,
   TextInput,
+  ViewToken,
+  Platform,
 } from 'react-native';
 import { NativeModules } from 'react-native';
 import { PasswordModal } from '../components/PasswordModal';
 import { ArchiveEngine } from '../services/ArchiveEngine';
 import { MMKV } from '../services/MMKV';
+import { FigmaTheme } from '../theme/FigmaTheme';
+import {
+  SearchOutlineIcon,
+  ZoomInIcon,
+  ZoomOutIcon,
+  DocListOutlineIcon,
+  WarningTriangleIcon,
+} from '../components/AppIcons';
 
 const { ArchiveModule } = NativeModules;
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -27,21 +36,178 @@ interface PdfViewerProps {
   onClose: () => void;
 }
 
+interface SearchMatch {
+  pageIndex: number;
+  matchIndex: number;
+  snippet: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Single virtualized PDF page item
+const PdfPageItem = memo(({
+  pageIndex,
+  filePath,
+  pageWidth,
+  isNightMode,
+  isSearchMode,
+  pageMatches,
+  currentMatchIdx,
+}: {
+  pageIndex: number;
+  filePath: string;
+  pageWidth: number;
+  isNightMode: boolean;
+  isSearchMode: boolean;
+  pageMatches: SearchMatch[];
+  currentMatchIdx: number;
+}) => {
+  const [imageUri, setImageUri] = useState<string | null>(null);
+  const [aspectRatio, setAspectRatio] = useState<number>(1.414);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [hasError, setHasError] = useState<boolean>(false);
+
+  useEffect(() => {
+    let isMounted = true;
+    setIsLoading(true);
+    setHasError(false);
+
+    ArchiveModule.renderPdfPage(filePath, pageIndex, Math.round(pageWidth * 2))
+      .then((res: any) => {
+        if (!isMounted) return;
+        if (res?.imagePath) {
+          setImageUri(res.imagePath);
+          if (res.width && res.height && res.width > 0) {
+            setAspectRatio(res.height / res.width);
+          }
+        }
+        setIsLoading(false);
+      })
+      .catch((err: any) => {
+        if (!isMounted) return;
+        console.warn(`Error rendering PDF page ${pageIndex + 1}:`, err);
+        setHasError(true);
+        setIsLoading(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [filePath, pageIndex, pageWidth]);
+
+  const pageHeight = Math.round(pageWidth * aspectRatio);
+  const hasMatches = isSearchMode && pageMatches.length > 0;
+
+  return (
+    <View
+      style={[
+        styles.pageCard,
+        {
+          width: pageWidth,
+          minHeight: pageHeight,
+          backgroundColor: isNightMode ? '#1E293B' : '#FFFFFF',
+          borderColor: hasMatches ? '#F59E0B' : isNightMode ? '#334155' : '#E2E8F0',
+          borderWidth: hasMatches ? 2 : 1,
+        },
+      ]}>
+      {isLoading && (
+        <View style={[styles.pagePlaceholder, { height: pageHeight }]}>
+          <ActivityIndicator size="small" color={isNightMode ? '#38BDF8' : FigmaTheme.colors.primary} />
+          <Text style={[styles.placeholderText, isNightMode && styles.textMutedNight]}>
+            Loading Page {pageIndex + 1}...
+          </Text>
+        </View>
+      )}
+
+      {hasError && !isLoading && (
+        <View style={[styles.pagePlaceholder, { height: pageHeight }]}>
+          <Text style={styles.errorIconSmall}>⚠️</Text>
+          <Text style={[styles.placeholderText, isNightMode && styles.textMutedNight]}>
+            Could not render page {pageIndex + 1}
+          </Text>
+        </View>
+      )}
+
+      {imageUri && (
+        <Image
+          source={{ uri: imageUri }}
+          style={[
+            styles.pageImage,
+            { width: pageWidth, height: pageHeight },
+            isNightMode && styles.imageNight,
+          ]}
+          resizeMode="contain"
+          onLoadEnd={() => setIsLoading(false)}
+        />
+      )}
+
+      {/* In-Place Yellow Text Highlights matching Figma Screen 2 */}
+      {isSearchMode &&
+        pageMatches.map((m) => {
+          const isActive = m.matchIndex === currentMatchIdx;
+          return (
+            <View
+              key={`match-rect-${m.matchIndex}`}
+              pointerEvents="none"
+              style={[
+                styles.highlightBox,
+                {
+                  left: `${m.x}%`,
+                  top: `${m.y}%`,
+                  width: `${m.width}%`,
+                  height: `${m.height}%`,
+                  backgroundColor: isActive ? '#FDE047' : 'rgba(254, 240, 138, 0.70)',
+                  borderWidth: isActive ? 1.5 : 0,
+                  borderColor: '#B45309',
+                },
+              ]}
+            />
+          );
+        })}
+    </View>
+  );
+});
+
 export const PdfViewer: React.FC<PdfViewerProps> = ({ filePath, fileName, onClose }) => {
   const [pageCount, setPageCount] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(0);
-  const [currentPageUri, setCurrentPageUri] = useState<string | null>(null);
+  const [fileSizeBytes, setFileSizeBytes] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isPasswordModalVisible, setIsPasswordModalVisible] = useState<boolean>(false);
   const [passwordError, setPasswordError] = useState<string | null>(null);
-  
+
+  // Real Search Mode State (Figma Screen 2)
+  const [isSearchMode, setIsSearchMode] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [totalMatches, setTotalMatches] = useState<number>(0);
+  const [matchingPages, setMatchingPages] = useState<number[]>([]);
+  const [matchesList, setMatchesList] = useState<SearchMatch[]>([]);
+  const [pageMatchCounts, setPageMatchCounts] = useState<{ [page: number]: number }>({});
+  const [currentMatchIdx, setCurrentMatchIdx] = useState<number>(0);
+  const [isSearching, setIsSearching] = useState<boolean>(false);
+
   // Jump to page modal state
   const [showJumpModal, setShowJumpModal] = useState<boolean>(false);
   const [jumpPageInput, setJumpPageInput] = useState<string>('');
   const [isNightMode, setIsNightMode] = useState<boolean>(false);
+  const [zoomScale, setZoomScale] = useState<number>(1.0);
 
+  // Action Menu Popover
+  const [showActionMenu, setShowActionMenu] = useState<boolean>(false);
+
+  const flatListRef = useRef<FlatList<any>>(null);
+  const searchDebounceRef = useRef<any>(null);
   const engine = ArchiveEngine.getInstance();
+
+  const formatBytes = (bytes?: number): string => {
+    if (!bytes || bytes <= 0) return '--';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
 
   const loadPdf = async () => {
     setIsLoading(true);
@@ -61,33 +227,25 @@ export const PdfViewer: React.FC<PdfViewerProps> = ({ filePath, fileName, onClos
         return;
       }
 
-      setPageCount(info.pageCount);
-      // Restore last read position (Master PRD Section 2.2)
-      const lastPos = MMKV.getPosition(filePath);
-      const startPage = lastPos && lastPos.page !== undefined && lastPos.page < info.pageCount ? lastPos.page : 0;
-      setCurrentPage(startPage);
-      await renderPage(startPage, info.pageCount);
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to initialize PDF renderer.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
+      const total = info.pageCount || 0;
+      setPageCount(total);
+      if (info.fileSize) {
+        setFileSizeBytes(info.fileSize);
+      }
 
-  const renderPage = async (pageIdx: number, totalOverride?: number) => {
-    setIsLoading(true);
-    try {
-      // High-res rendering (screen width * 2) for crisp fonts and emojis
-      const renderRes = await ArchiveModule.renderPdfPage(filePath, pageIdx, SCREEN_WIDTH * 2);
-      setCurrentPageUri(renderRes.imagePath);
-      setCurrentPage(pageIdx);
-      // Persist last read page for continue reading
-      const total = totalOverride || pageCount;
-      if (total > 0) {
-        MMKV.savePosition(filePath, { page: pageIdx, total });
+      // Restore last read position
+      const lastPos = MMKV.getPosition(filePath);
+      const startPage =
+        lastPos && lastPos.page !== undefined && lastPos.page < total ? lastPos.page : 0;
+      setCurrentPage(startPage);
+
+      if (startPage > 0) {
+        setTimeout(() => {
+          flatListRef.current?.scrollToIndex({ index: startPage, animated: false });
+        }, 150);
       }
     } catch (err: any) {
-      setErrorMsg(`Page render error: ${err.message}`);
+      setErrorMsg(err.message || 'Failed to initialize PDF renderer.');
     } finally {
       setIsLoading(false);
     }
@@ -97,33 +255,111 @@ export const PdfViewer: React.FC<PdfViewerProps> = ({ filePath, fileName, onClos
     loadPdf();
   }, [filePath]);
 
-  const handleNextPage = () => {
-    if (currentPage < pageCount - 1) {
-      renderPage(currentPage + 1);
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      if (viewableItems && viewableItems.length > 0) {
+        const visibleIdx = viewableItems[0].index;
+        if (visibleIdx !== null && visibleIdx !== undefined && visibleIdx !== currentPage) {
+          setCurrentPage(visibleIdx);
+          if (pageCount > 0) {
+            MMKV.savePosition(filePath, { page: visibleIdx, total: pageCount });
+          }
+        }
+      }
+    },
+    [currentPage, pageCount, filePath]
+  );
+
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 40,
+  }).current;
+
+  // Real PDF search execution via Native Module
+  const executeSearch = useCallback((query: string) => {
+    const q = query.trim();
+    if (!q) {
+      setTotalMatches(0);
+      setMatchingPages([]);
+      setMatchesList([]);
+      setPageMatchCounts({});
+      setCurrentMatchIdx(0);
+      setIsSearching(false);
+      return;
     }
+
+    setIsSearching(true);
+    ArchiveModule.searchPdfText(filePath, q)
+      .then((res: any) => {
+        const total = res.totalMatches || 0;
+        const pages: number[] = res.matchingPages || [];
+        const matches: SearchMatch[] = res.matches || [];
+        const countsMap: { [page: number]: number } = {};
+
+        if (res.pageMatchCounts && Array.isArray(res.pageMatchCounts)) {
+          res.pageMatchCounts.forEach((item: any) => {
+            countsMap[item.pageIndex] = item.count;
+          });
+        }
+
+        setTotalMatches(total);
+        setMatchingPages(pages);
+        setMatchesList(matches);
+        setPageMatchCounts(countsMap);
+        setCurrentMatchIdx(total > 0 ? 0 : -1);
+
+        if (matches.length > 0) {
+          const targetPage = matches[0].pageIndex;
+          setCurrentPage(targetPage);
+          flatListRef.current?.scrollToIndex({ index: targetPage, animated: true });
+        }
+      })
+      .catch((err: any) => {
+        console.warn('Real PDF search error:', err);
+        setTotalMatches(0);
+        setMatchingPages([]);
+        setMatchesList([]);
+        setPageMatchCounts({});
+        setCurrentMatchIdx(-1);
+      })
+      .finally(() => {
+        setIsSearching(false);
+      });
+  }, [filePath]);
+
+  const handleSearchChange = (text: string) => {
+    setSearchQuery(text);
+    if (searchDebounceRef.current) {
+      clearTimeout(searchDebounceRef.current);
+    }
+    searchDebounceRef.current = setTimeout(() => {
+      executeSearch(text);
+    }, 200);
   };
 
-  const handlePrevPage = () => {
-    if (currentPage > 0) {
-      renderPage(currentPage - 1);
-    }
+  const handleNextMatch = () => {
+    if (matchesList.length === 0) return;
+    const nextIdx = (currentMatchIdx + 1) % matchesList.length;
+    setCurrentMatchIdx(nextIdx);
+    const targetPage = matchesList[nextIdx].pageIndex;
+    setCurrentPage(targetPage);
+    flatListRef.current?.scrollToIndex({ index: targetPage, animated: true });
   };
 
-  const handleSliderTap = (event: any) => {
-    if (pageCount <= 1) return;
-    const clickX = event.nativeEvent.locationX;
-    const barWidth = SCREEN_WIDTH - 150;
-    const ratio = Math.max(0, Math.min(1, clickX / barWidth));
-    const targetPage = Math.min(pageCount - 1, Math.floor(ratio * pageCount));
-    if (targetPage !== currentPage) {
-      renderPage(targetPage);
-    }
+  const handlePrevMatch = () => {
+    if (matchesList.length === 0) return;
+    const prevIdx = (currentMatchIdx - 1 + matchesList.length) % matchesList.length;
+    setCurrentMatchIdx(prevIdx);
+    const targetPage = matchesList[prevIdx].pageIndex;
+    setCurrentPage(targetPage);
+    flatListRef.current?.scrollToIndex({ index: targetPage, animated: true });
   };
 
   const handleJumpSubmit = () => {
     const p = parseInt(jumpPageInput.trim(), 10);
     if (!isNaN(p) && p >= 1 && p <= pageCount) {
-      renderPage(p - 1);
+      const targetIndex = p - 1;
+      setCurrentPage(targetIndex);
+      flatListRef.current?.scrollToIndex({ index: targetIndex, animated: true });
       setShowJumpModal(false);
       setJumpPageInput('');
     }
@@ -137,146 +373,283 @@ export const PdfViewer: React.FC<PdfViewerProps> = ({ filePath, fileName, onClos
     }
   };
 
-  const progressPercent = pageCount > 0 ? ((currentPage + 1) / pageCount) * 100 : 0;
+  const pageWidth = Math.round((SCREEN_WIDTH - 24) * zoomScale);
+  const matchesOnCurrentPage = pageMatchCounts[currentPage] || 0;
 
   return (
-    <SafeAreaView style={[styles.container, isNightMode && styles.containerNight]}>
-      <StatusBar
-        barStyle={isNightMode ? 'light-content' : 'dark-content'}
-        backgroundColor={isNightMode ? '#0f172a' : '#ffffff'}
-      />
+    <View style={[styles.container, isNightMode && styles.containerNight]}>
+      <StatusBar hidden={true} />
 
-      {/* Clean Top Header */}
-      <View style={[styles.header, isNightMode && styles.headerNight]}>
-        <View style={styles.headerLeft}>
-          <Text style={[styles.fileName, isNightMode && styles.textLight]} numberOfLines={1}>
-            📕 {fileName}
-          </Text>
-          <Text style={[styles.pageIndicator, isNightMode && styles.textMutedNight]}>
-            {pageCount > 0 ? `Page ${currentPage + 1} of ${pageCount} (${Math.round(progressPercent)}%)` : 'Loading...'}
-          </Text>
-        </View>
+      {/* 1. TOP HEADER (FIGMA BLUE #016EEF, COMPACT STATUS-BAR SAFE) */}
+      <View style={styles.header}>
+        {isSearchMode ? (
+          /* FIGMA SCREEN 2: PDF VIEWER — SEARCH HEADER */
+          <View style={styles.searchHeaderRow}>
+            {/* Back button from search */}
+            <TouchableOpacity
+              style={styles.backBtn}
+              activeOpacity={0.7}
+              onPress={() => {
+                setIsSearchMode(false);
+                setSearchQuery('');
+                setTotalMatches(0);
+                setMatchingPages([]);
+                setPageMatchCounts({});
+              }}>
+              <Text style={styles.backIcon}>&lt;</Text>
+            </TouchableOpacity>
 
-        <View style={styles.headerRight}>
-          <TouchableOpacity
-            style={[styles.nightToggleBtn, isNightMode && styles.nightToggleBtnActive]}
-            onPress={() => setIsNightMode(!isNightMode)}
-            activeOpacity={0.7}>
-            <Text style={[styles.nightToggleText, isNightMode && styles.textLight]}>
-              {isNightMode ? '☀️ Day' : '🌙 Night'}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.shareBtn} onPress={handleShare} activeOpacity={0.7}>
-            <Text style={styles.shareBtnText}>📤 Share</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.closeBtn} onPress={onClose} activeOpacity={0.7}>
-            <Text style={styles.closeBtnText}>✕ Close</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
+            {/* White Search Pill */}
+            <View style={styles.searchPillContainer}>
+              <SearchOutlineIcon size={16} color={FigmaTheme.colors.primary} />
+              <TextInput
+                style={styles.searchPillInput}
+                placeholder="Search..."
+                placeholderTextColor="#64748B"
+                value={searchQuery}
+                onChangeText={handleSearchChange}
+                autoFocus
+                returnKeyType="search"
+              />
+              {isSearching ? (
+                <ActivityIndicator size="small" color={FigmaTheme.colors.primary} style={{ marginLeft: 6 }} />
+              ) : searchQuery.trim().length > 0 ? (
+                <Text style={styles.searchMatchCountText}>
+                  {totalMatches > 0 ? `${currentMatchIdx + 1} of ${totalMatches}` : '0 of 0'}
+                </Text>
+              ) : null}
+            </View>
 
-      {/* Main Page Viewport */}
-      <View style={styles.viewportContainer}>
-        {errorMsg ? (
-          <View style={styles.centerBox}>
-            <View style={styles.errorCard}>
-              <Text style={styles.errorIcon}>⚠️</Text>
-              <Text style={styles.errorTitle}>Cannot Open PDF</Text>
-              <Text style={styles.errorDesc}>{errorMsg}</Text>
+            {/* Up / Down Navigation Buttons */}
+            <View style={styles.searchNavArrows}>
+              <TouchableOpacity
+                style={styles.searchArrowBtn}
+                activeOpacity={0.7}
+                disabled={matchingPages.length === 0}
+                onPress={handlePrevMatch}>
+                <Text style={styles.searchArrowText}>∧</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.searchArrowBtn}
+                activeOpacity={0.7}
+                disabled={matchingPages.length === 0}
+                onPress={handleNextMatch}>
+                <Text style={styles.searchArrowText}>∨</Text>
+              </TouchableOpacity>
             </View>
           </View>
         ) : (
-          <ScrollView
-            contentContainerStyle={styles.scrollContent}
-            maximumZoomScale={4}
-            minimumZoomScale={1}
-            showsVerticalScrollIndicator={false}>
-            {isLoading && (
-              <View style={styles.loadingOverlay}>
-                <ActivityIndicator size="large" color="#d93025" />
-              </View>
-            )}
-            {currentPageUri && (
-              <Image
-                source={{ uri: currentPageUri }}
-                style={{
-                  width: SCREEN_WIDTH - 24,
-                  height: (SCREEN_WIDTH - 24) * 1.414,
-                  borderRadius: 6,
-                }}
-                resizeMode="contain"
-              />
-            )}
-          </ScrollView>
+          /* FIGMA SCREEN 1: NORMAL VIEWER HEADER */
+          <View style={styles.headerTopRow}>
+            {/* Oval Back Button */}
+            <TouchableOpacity style={styles.backBtn} onPress={onClose} activeOpacity={0.7}>
+              <Text style={styles.backIcon}>&lt;</Text>
+            </TouchableOpacity>
+
+            {/* File info (Title + Subtitle) */}
+            <View style={styles.headerInfoCol}>
+              <Text style={styles.fileName} numberOfLines={1}>
+                {fileName}
+              </Text>
+              <Text style={styles.fileSubtitle}>
+                {`PDF · ${formatBytes(fileSizeBytes)}`}
+              </Text>
+            </View>
+
+            {/* White Circular Action Menu Button [ ⋮ ] */}
+            <TouchableOpacity
+              style={styles.actionMenuBtn}
+              activeOpacity={0.7}
+              onPress={() => setShowActionMenu(true)}>
+              <Text style={styles.actionMenuDots}>⋮</Text>
+            </TouchableOpacity>
+          </View>
         )}
       </View>
 
-      {/* Interactive Bottom Page Slider Bar */}
-      {pageCount > 1 && !errorMsg && (
-        <View style={[styles.bottomBar, isNightMode && styles.bottomBarNight]}>
+      {/* 2. MAIN CONTENT AREA */}
+      {isLoading ? (
+        <View style={styles.centerBox}>
+          <ActivityIndicator size="large" color={FigmaTheme.colors.primary} />
+          <Text style={[styles.loadingText, isNightMode && styles.textLight]}>
+            Loading PDF Document...
+          </Text>
+        </View>
+      ) : errorMsg ? (
+        /* FIGMA SCREEN 6: PDF CANNOT DISPLAY ERROR STATE */
+        <View style={styles.errorContainer}>
+          <View style={styles.errorIconCircle}>
+            <WarningTriangleIcon size={30} color="#EA580C" innerColor="#FFF7ED" />
+          </View>
+          <Text style={styles.errorHeading}>Some content can't be shown</Text>
+          <Text style={styles.errorSubheading}>
+            This PDF uses features that aren't supported here. You can still share the original file.
+          </Text>
+
           <TouchableOpacity
-            style={[styles.navBtn, currentPage <= 0 && styles.disabledBtn]}
-            disabled={currentPage <= 0 || isLoading}
-            onPress={handlePrevPage}>
-            <Text style={styles.navBtnText}>◀</Text>
+            style={styles.errorShareBtn}
+            activeOpacity={0.8}
+            onPress={handleShare}>
+            <Text style={styles.errorShareBtnText}>Share file</Text>
           </TouchableOpacity>
 
-          {/* Interactive Page Scrubber Track */}
           <TouchableOpacity
-            style={styles.sliderTrackWrapper}
-            activeOpacity={1}
-            onPress={handleSliderTap}>
-            <View style={styles.sliderTrackBg}>
-              <View style={[styles.sliderTrackFill, { width: `${progressPercent}%` }]} />
+            style={styles.errorBackBtn}
+            activeOpacity={0.8}
+            onPress={onClose}>
+            <Text style={styles.errorBackBtnText}>Back to files</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        /* PDF DOCUMENT CANVAS WITH FLOATING PILLS */
+        <View style={styles.viewportContainer}>
+          {/* Top Floating Page Indicator Pill (Figma Screen 1 & 2) */}
+          {pageCount > 0 && !isSearchMode && (
+            <TouchableOpacity
+              style={styles.topFloatingPill}
+              activeOpacity={0.8}
+              onPress={() => {
+                setJumpPageInput(String(currentPage + 1));
+                setShowJumpModal(true);
+              }}>
+              <Text style={styles.topFloatingPillText}>
+                Page {currentPage + 1} of {pageCount}
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          {/* Top Floating Match Indicator in Search Mode (Figma Screen 2) */}
+          {isSearchMode && searchQuery.trim().length > 0 && (
+            <View style={styles.topSearchMatchPill}>
+              <Text style={styles.topSearchMatchText}>
+                {totalMatches === 0
+                  ? 'No matches found'
+                  : matchesOnCurrentPage > 0
+                  ? `${matchesOnCurrentPage} matches on this page`
+                  : '0 matches on this page'}
+              </Text>
             </View>
-          </TouchableOpacity>
+          )}
 
-          <TouchableOpacity
-            style={styles.pageBadge}
-            onPress={() => {
-              setJumpPageInput(String(currentPage + 1));
-              setShowJumpModal(true);
-            }}>
-            <Text style={styles.pageBadgeText}>
-              {currentPage + 1}/{pageCount}
-            </Text>
-          </TouchableOpacity>
+          {/* Virtualized Pages FlatList */}
+          <FlatList
+            ref={flatListRef}
+            data={Array.from({ length: pageCount }).map((_, i) => i)}
+            keyExtractor={(idx) => `pdf-page-${idx}`}
+            showsVerticalScrollIndicator={true}
+            contentContainerStyle={styles.listContent}
+            onViewableItemsChanged={onViewableItemsChanged}
+            viewabilityConfig={viewabilityConfig}
+            initialNumToRender={2}
+            maxToRenderPerBatch={3}
+            windowSize={5}
+            removeClippedSubviews={true}
+            onScrollToIndexFailed={(info) => {
+              const itemHeight = Math.round(pageWidth * 1.414) + 8;
+              flatListRef.current?.scrollToOffset({
+                offset: info.index * itemHeight,
+                animated: true,
+              });
+              setTimeout(() => {
+                flatListRef.current?.scrollToIndex({ index: info.index, animated: true });
+              }, 120);
+            }}
+            renderItem={({ item: pageIdx }) => {
+              const pageMatches = matchesList.filter((m) => m.pageIndex === pageIdx);
+              return (
+                <PdfPageItem
+                  pageIndex={pageIdx}
+                  filePath={filePath}
+                  pageWidth={pageWidth}
+                  isNightMode={isNightMode}
+                  isSearchMode={isSearchMode}
+                  pageMatches={pageMatches}
+                  currentMatchIdx={currentMatchIdx}
+                />
+              );
+            }}
+          />
 
-          <TouchableOpacity
-            style={[styles.navBtn, currentPage >= pageCount - 1 && styles.disabledBtn]}
-            disabled={currentPage >= pageCount - 1 || isLoading}
-            onPress={handleNextPage}>
-            <Text style={styles.navBtnText}>▶</Text>
-          </TouchableOpacity>
+          {/* 3. FIGMA FLOATING BOTTOM TOOLBAR (#0D084C) */}
+          {pageCount > 0 && (
+            <View style={styles.bottomToolbarContainer}>
+              <View style={styles.darkBottomToolbar}>
+                {/* 1. Search */}
+                <TouchableOpacity
+                  style={styles.toolbarBtn}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                  onPress={() => setIsSearchMode(true)}>
+                  <SearchOutlineIcon size={19} color="#FFFFFF" />
+                </TouchableOpacity>
+
+                {/* 2. Zoom Out */}
+                <TouchableOpacity
+                  style={styles.toolbarBtn}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                  disabled={zoomScale <= 0.75}
+                  onPress={() => setZoomScale((s) => Math.max(0.75, Number((s - 0.15).toFixed(2))))}>
+                  <ZoomOutIcon size={19} color="#FFFFFF" />
+                </TouchableOpacity>
+
+                {/* 3. Zoom In */}
+                <TouchableOpacity
+                  style={styles.toolbarBtn}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                  disabled={zoomScale >= 2.0}
+                  onPress={() => setZoomScale((s) => Math.min(2.0, Number((s + 0.15).toFixed(2))))}>
+                  <ZoomInIcon size={19} color="#FFFFFF" />
+                </TouchableOpacity>
+
+                {/* Thin vertical separator */}
+                <View style={styles.toolbarDivider} />
+
+                {/* 4. Document / TOC / Jump */}
+                <TouchableOpacity
+                  style={styles.toolbarBtn}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+                  onPress={() => {
+                    setJumpPageInput(String(currentPage + 1));
+                    setShowJumpModal(true);
+                  }}>
+                  <DocListOutlineIcon size={19} color="#FFFFFF" />
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
         </View>
       )}
 
-      {/* Jump to Page Modal */}
-      <Modal
-        visible={showJumpModal}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setShowJumpModal(false)}>
-        <View style={styles.modalBackdrop}>
+      {/* JUMP TO PAGE MODAL */}
+      <Modal visible={showJumpModal} transparent animationType="fade" onRequestClose={() => setShowJumpModal(false)}>
+        <View style={styles.modalOverlay}>
           <View style={styles.jumpCard}>
             <Text style={styles.jumpTitle}>Jump to Page</Text>
-            <Text style={styles.jumpSub}>Enter page between 1 and {pageCount}</Text>
+            <Text style={styles.jumpSubtitle}>Enter page number (1 to {pageCount}):</Text>
+
             <TextInput
               style={styles.jumpInput}
               keyboardType="number-pad"
+              autoFocus
               value={jumpPageInput}
               onChangeText={setJumpPageInput}
-              autoFocus={true}
-              selectTextOnFocus={true}
+              placeholder={`1 - ${pageCount}`}
+              placeholderTextColor="#94A3B8"
             />
+
             <View style={styles.jumpBtnRow}>
               <TouchableOpacity
                 style={styles.jumpCancelBtn}
+                activeOpacity={0.7}
                 onPress={() => setShowJumpModal(false)}>
                 <Text style={styles.jumpCancelText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.jumpGoBtn}
+                activeOpacity={0.8}
                 onPress={handleJumpSubmit}>
                 <Text style={styles.jumpGoText}>Go</Text>
               </TouchableOpacity>
@@ -285,183 +658,385 @@ export const PdfViewer: React.FC<PdfViewerProps> = ({ filePath, fileName, onClos
         </View>
       </Modal>
 
-      {/* Password Modal */}
+      {/* 3-DOTS ACTION MENU POPOVER */}
+      <Modal visible={showActionMenu} transparent animationType="fade" onRequestClose={() => setShowActionMenu(false)}>
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPress={() => setShowActionMenu(false)}>
+          <View style={styles.menuPopover}>
+            <TouchableOpacity
+              style={styles.menuRow}
+              activeOpacity={0.7}
+              onPress={() => {
+                setShowActionMenu(false);
+                setJumpPageInput(String(currentPage + 1));
+                setShowJumpModal(true);
+              }}>
+              <Text style={styles.menuRowText}>📄  Jump to page</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.menuRow}
+              activeOpacity={0.7}
+              onPress={() => {
+                setShowActionMenu(false);
+                handleShare();
+              }}>
+              <Text style={styles.menuRowText}>📤  Share PDF</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.menuRow}
+              activeOpacity={0.7}
+              onPress={() => {
+                setShowActionMenu(false);
+                setIsNightMode(!isNightMode);
+              }}>
+              <Text style={styles.menuRowText}>
+                {isNightMode ? '☀️  Light mode' : '🌙  Dark mode'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* PASSWORD PROTECTION MODAL (Figma Screen 3, 4, 5) */}
       <PasswordModal
         visible={isPasswordModalVisible}
         fileName={fileName}
         errorMsg={passwordError}
         isLoading={isLoading}
-        onUnlock={() => loadPdf()}
+        onUnlock={(_pwd) => loadPdf()}
         onCancel={() => {
           setIsPasswordModalVisible(false);
           onClose();
         }}
       />
-    </SafeAreaView>
+    </View>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: '#F1F5F9',
   },
+  containerNight: {
+    backgroundColor: '#0F172A',
+  },
+
+  // 1. Blue Header (#016EEF) - Compact Status-Bar Safe
   header: {
+    backgroundColor: FigmaTheme.colors.headerBlue,
+    paddingTop: 8,
+    paddingBottom: 8,
+    paddingHorizontal: 16,
+  },
+  headerTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#ffffff',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#e2e8f0',
+    gap: 12,
   },
-  headerLeft: {
+  backBtn: {
+    width: 34,
+    height: 40,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  backIcon: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#FFFFFF',
+    marginTop: -2,
+  },
+  headerInfoCol: {
     flex: 1,
-    marginRight: 10,
   },
   fileName: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '700',
-    color: '#0f172a',
+    color: '#FFFFFF',
+    letterSpacing: -0.2,
   },
-  pageIndicator: {
-    fontSize: 12,
-    color: '#64748b',
-    marginTop: 2,
+  fileSubtitle: {
+    fontSize: 11.5,
+    color: 'rgba(255, 255, 255, 0.82)',
+    marginTop: 1,
+    fontWeight: '500',
   },
-  headerRight: {
+  actionMenuBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    ...FigmaTheme.shadows.card,
+  },
+  actionMenuDots: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: FigmaTheme.colors.primary,
+    marginTop: -2,
+  },
+
+  // Search Header in Screen 2
+  searchHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 10,
   },
-  shareBtn: {
-    backgroundColor: '#eff6ff',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#bfdbfe',
-  },
-  shareBtnText: {
-    color: '#1d4ed8',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  closeBtn: {
-    backgroundColor: '#f1f5f9',
+  searchPillContainer: {
+    flex: 1,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    alignItems: 'center',
     paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
   },
-  closeBtnText: {
-    fontSize: 13,
+  searchPillInput: {
+    flex: 1,
+    fontSize: 14,
+    color: '#0F172A',
+    marginLeft: 8,
+    paddingVertical: 0,
+  },
+  searchMatchCountText: {
+    fontSize: 12,
     fontWeight: '600',
-    color: '#475569',
+    color: '#64748B',
+    marginLeft: 6,
   },
+  searchNavArrows: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  searchArrowBtn: {
+    width: 32,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  searchArrowText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+
+  // 2. Viewport & Canvas
   viewportContainer: {
     flex: 1,
+    position: 'relative',
   },
+  listContent: {
+    paddingTop: 36,
+    paddingBottom: 88,
+    alignItems: 'center',
+  },
+
+  // Floating Page Indicator Pills - Centered top with minimal gap
+  topFloatingPill: {
+    position: 'absolute',
+    top: 8,
+    alignSelf: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    zIndex: 10,
+    ...FigmaTheme.shadows.card,
+  },
+  topFloatingPillText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: '#64748B',
+  },
+  topSearchMatchPill: {
+    position: 'absolute',
+    top: 8,
+    alignSelf: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    zIndex: 10,
+    ...FigmaTheme.shadows.card,
+  },
+  topSearchMatchText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+
+  // Page Card with minimal vertical margin
+  pageCard: {
+    marginVertical: 4,
+    borderRadius: 4,
+    borderWidth: 1,
+    overflow: 'hidden',
+    position: 'relative',
+    ...FigmaTheme.shadows.card,
+  },
+  highlightBox: {
+    position: 'absolute',
+    borderRadius: 3,
+    zIndex: 10,
+  },
+  pagePlaceholder: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+  },
+  placeholderText: {
+    marginTop: 8,
+    fontSize: 12,
+    color: '#64748B',
+  },
+  errorIconSmall: {
+    fontSize: 24,
+  },
+  pageImage: {
+    backgroundColor: '#FFFFFF',
+  },
+  imageNight: {
+    opacity: 0.9,
+  },
+  textMutedNight: {
+    color: '#94A3B8',
+  },
+  textLight: {
+    color: '#F8FAFC',
+  },
+
+  // 3. Figma Floating Bottom Toolbar (#0D084C)
+  bottomToolbarContainer: {
+    position: 'absolute',
+    bottom: Platform.OS === 'android' ? 24 : 34,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 20,
+  },
+  darkBottomToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0D084C', // Exact color requested
+    height: 52,
+    borderRadius: 26,
+    paddingHorizontal: 16,
+    gap: 6,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    elevation: 10,
+  },
+  toolbarBtn: {
+    paddingHorizontal: 12,
+    height: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  toolbarDivider: {
+    width: 1,
+    height: 22,
+    backgroundColor: 'rgba(255, 255, 255, 0.25)',
+    marginHorizontal: 4,
+  },
+
+  // Center / Loading / Error
   centerBox: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 24,
   },
-  errorCard: {
-    backgroundColor: '#ffffff',
-    padding: 24,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#fca5a5',
-    alignItems: 'center',
-    width: '100%',
+  loadingText: {
+    marginTop: 14,
+    fontSize: 14,
+    color: '#64748B',
+    fontWeight: '600',
   },
-  errorIcon: {
-    fontSize: 32,
-    marginBottom: 8,
-  },
-  errorTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#b91c1c',
-  },
-  errorDesc: {
-    fontSize: 13,
-    color: '#64748b',
-    textAlign: 'center',
-    marginTop: 6,
-  },
-  scrollContent: {
-    alignItems: 'center',
-    paddingVertical: 12,
-  },
-  loadingOverlay: {
-    position: 'absolute',
-    top: '40%',
-    zIndex: 10,
-    backgroundColor: 'rgba(255, 255, 255, 0.85)',
-    padding: 16,
-    borderRadius: 12,
-  },
-  bottomBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#ffffff',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: '#e2e8f0',
-    gap: 8,
-  },
-  navBtn: {
-    backgroundColor: '#f1f5f9',
-    width: 38,
-    height: 38,
-    borderRadius: 8,
+
+  // Screen 6: Cannot Display
+  errorContainer: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
     justifyContent: 'center',
     alignItems: 'center',
+    paddingHorizontal: 32,
   },
-  disabledBtn: {
-    opacity: 0.35,
+  errorIconCircle: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#FFF7ED',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 18,
   },
-  navBtnText: {
-    fontSize: 14,
+  errorHeading: {
+    fontSize: 18,
     fontWeight: '700',
-    color: '#1e293b',
+    color: '#0F172A',
+    marginBottom: 8,
+    textAlign: 'center',
   },
-  sliderTrackWrapper: {
-    flex: 1,
-    paddingVertical: 10,
+  errorSubheading: {
+    fontSize: 13.5,
+    color: '#64748B',
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 28,
+    maxWidth: 280,
   },
-  sliderTrackBg: {
-    height: 6,
-    backgroundColor: '#e2e8f0',
-    borderRadius: 3,
-    overflow: 'hidden',
+  errorShareBtn: {
+    backgroundColor: FigmaTheme.colors.primary,
+    height: 48,
+    borderRadius: 12,
+    width: '100%',
+    maxWidth: 280,
+    justifyContent: 'center',
+    alignItems: 'center',
+    ...FigmaTheme.shadows.card,
   },
-  sliderTrackFill: {
-    height: '100%',
-    backgroundColor: '#dc2626',
-    borderRadius: 3,
-  },
-  pageBadge: {
-    backgroundColor: '#fef2f2',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#fecaca',
-  },
-  pageBadgeText: {
-    fontSize: 12,
+  errorShareBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15,
     fontWeight: '700',
-    color: '#dc2626',
   },
-  modalBackdrop: {
+  errorBackBtn: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: FigmaTheme.colors.primary,
+    height: 48,
+    borderRadius: 12,
+    width: '100%',
+    maxWidth: 280,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  errorBackBtnText: {
+    color: FigmaTheme.colors.primary,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+
+  // Modals & Popovers
+  modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    backgroundColor: 'rgba(15, 23, 42, 0.5)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 24,
@@ -469,90 +1044,82 @@ const styles = StyleSheet.create({
   jumpCard: {
     width: '100%',
     maxWidth: 320,
-    backgroundColor: '#ffffff',
-    borderRadius: 16,
-    padding: 20,
-    elevation: 8,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: 22,
+    ...FigmaTheme.shadows.card,
   },
   jumpTitle: {
     fontSize: 17,
     fontWeight: '700',
-    color: '#0f172a',
+    color: '#0F172A',
+    marginBottom: 6,
   },
-  jumpSub: {
-    fontSize: 12,
-    color: '#64748b',
-    marginTop: 4,
+  jumpSubtitle: {
+    fontSize: 13,
+    color: '#64748B',
+    marginBottom: 16,
   },
   jumpInput: {
+    height: 46,
+    borderRadius: 10,
     borderWidth: 1.5,
-    borderColor: '#dc2626',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#0f172a',
-    marginTop: 16,
-    textAlign: 'center',
+    borderColor: '#CBD5E1',
+    paddingHorizontal: 14,
+    fontSize: 16,
+    color: '#0F172A',
+    marginBottom: 20,
   },
   jumpBtnRow: {
     flexDirection: 'row',
-    justifyContent: 'flex-end',
     gap: 10,
-    marginTop: 20,
   },
   jumpCancelBtn: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 8,
+    flex: 1,
+    height: 42,
+    borderRadius: 10,
+    borderWidth: 1.2,
+    borderColor: '#CBD5E1',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   jumpCancelText: {
     fontSize: 14,
-    color: '#64748b',
-    fontWeight: '600',
+    fontWeight: '700',
+    color: '#0F172A',
   },
   jumpGoBtn: {
-    backgroundColor: '#dc2626',
-    paddingHorizontal: 20,
-    paddingVertical: 8,
-    borderRadius: 8,
+    flex: 1,
+    height: 42,
+    borderRadius: 10,
+    backgroundColor: FigmaTheme.colors.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   jumpGoText: {
     fontSize: 14,
-    color: '#ffffff',
     fontWeight: '700',
+    color: '#FFFFFF',
   },
-  containerNight: {
-    backgroundColor: '#121212',
+  menuPopover: {
+    position: 'absolute',
+    top: 50,
+    right: 16,
+    width: 200,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    paddingVertical: 6,
+    ...FigmaTheme.shadows.card,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
   },
-  headerNight: {
-    backgroundColor: '#1e293b',
-    borderBottomColor: '#334155',
+  menuRow: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
   },
-  bottomBarNight: {
-    backgroundColor: '#1e293b',
-    borderTopColor: '#334155',
-  },
-  nightToggleBtn: {
-    backgroundColor: '#f1f5f9',
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    borderRadius: 6,
-    marginRight: 6,
-  },
-  nightToggleBtnActive: {
-    backgroundColor: '#334155',
-  },
-  nightToggleText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#0f172a',
-  },
-  textLight: {
-    color: '#f8fafc',
-  },
-  textMutedNight: {
-    color: '#94a3b8',
+  menuRowText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#0F172A',
   },
 });

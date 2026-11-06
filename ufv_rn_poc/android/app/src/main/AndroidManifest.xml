@@ -84,6 +84,15 @@
             <data android:mimeType="*/*" />
         </intent-filter>
 
+        <!-- 3b. Open with: Any content URI (WhatsApp / Telegram / Drive) -->
+        <intent-filter>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="content" />
+            <data android:mimeType="*/*" />
+        </intent-filter>
+
         <!-- 4. Share target (SEND action) -->
         <intent-filter>
             <action android:name="android.intent.action.SEND" />
@@ -105,6 +114,13 @@
             <data android:mimeType="image/*" />
             <data android:mimeType="video/*" />
             <data android:mimeType="audio/*" />
+            <data android:mimeType="*/*" />
+        </intent-filter>
+
+        <!-- 5. Share target (SEND_MULTIPLE action from WhatsApp/Telegram) -->
+        <intent-filter>
+            <action android:name="android.intent.action.SEND_MULTIPLE" />
+            <category android:name="android.intent.category.DEFAULT" />
             <data android:mimeType="*/*" />
         </intent-filter>
       </activity>

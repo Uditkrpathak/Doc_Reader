@@ -187,7 +187,7 @@ export const CsvViewer: React.FC<CsvViewerProps> = ({
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0284c7" />
+      <StatusBar hidden={true} />
       {/* Header */}
       <View style={styles.header}>
         <View style={{ flex: 1, marginRight: 12 }}>

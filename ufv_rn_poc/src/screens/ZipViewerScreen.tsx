@@ -8,11 +8,19 @@ import {
   ActivityIndicator,
   SafeAreaView,
   StatusBar,
-  TextInput,
-  Platform,
 } from 'react-native';
 import { ArchiveEngine, ArchiveEntry } from '../services/ArchiveEngine';
 import { PasswordModal } from '../components/PasswordModal';
+import { RNFS } from '../services/RNFS';
+import { FigmaTheme } from '../theme/FigmaTheme';
+
+// Figma Extraction Modals (Figma Image 3 & 4 & 5)
+import {
+  ExtractionOptionsModal,
+  ExtractionProgressModal,
+  ExtractionResultModal,
+  ArchiveRecoveryModal,
+} from '../components/ExtractionModals';
 
 // Sub-viewers
 import { PdfViewer } from '../viewers/PdfViewer';
@@ -34,6 +42,7 @@ interface ArchiveItem {
   name: string;
   size: number;
   isDirectory: boolean;
+  isEncrypted?: boolean;
 }
 
 export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
@@ -48,12 +57,37 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
   const [extractingName, setExtractingName] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
 
+  // Multi-selection for extraction (Figma Image 3)
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+
   // Password Modal
   const [isPasswordModalVisible, setIsPasswordModalVisible] = useState<boolean>(false);
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [savedPassword, setSavedPassword] = useState<string | null>(null);
   const [pendingFileItem, setPendingFileItem] = useState<ArchiveItem | null>(null);
-  const [isCappedNotice, setIsCappedNotice] = useState<boolean>(false);
+
+  // Extraction Modals State (Figma Image 4)
+  const [isExtractionOptionsVisible, setIsExtractionOptionsVisible] = useState<boolean>(false);
+  const [isExtractionProgressVisible, setIsExtractionProgressVisible] = useState<boolean>(false);
+  const [extractionProgress, setExtractionProgress] = useState<{ current: number; total: number; file: string; percent: number }>({
+    current: 0,
+    total: 0,
+    file: '',
+    percent: 0,
+  });
+  const [isExtractionResultVisible, setIsExtractionResultVisible] = useState<boolean>(false);
+  const [extractionResult, setExtractionResult] = useState<{
+    successCount: number;
+    totalCount: number;
+    dest: string;
+    failed: Array<{ name: string; reason: string }>;
+  }>({ successCount: 0, totalCount: 0, dest: '', failed: [] });
+
+  // Recovery Modal State (Figma Image 5)
+  const [recoveryState, setRecoveryState] = useState<{
+    visible: boolean;
+    type: 'DAMAGED' | 'MISSING_PART' | 'UNSUPPORTED_METHOD' | 'TOO_LARGE' | 'INSUFFICIENT_STORAGE';
+  }>({ visible: false, type: 'DAMAGED' });
 
   // Active sub-viewer modal
   const [activeViewer, setActiveViewer] = useState<{
@@ -65,11 +99,11 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
 
   const extractedFilesRef = useRef<string[]>([]);
   const engine = ArchiveEngine.getInstance();
+  const defaultDownloadDest = RNFS.DownloadDirectoryPath || '/storage/emulated/0/Download';
 
   useEffect(() => {
     loadContents();
     return () => {
-      // Clean up extracted files on unmount
       for (const extractedPath of extractedFilesRef.current) {
         engine.deleteCachedFile(extractedPath).catch(() => {});
       }
@@ -83,22 +117,17 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
 
     try {
       const list: ArchiveEntry[] = await engine.list(filePath, password);
-      let capped = false;
       const validEntries = list.filter((e) => {
         const p = e.path || e.name || '';
-        if (p.startsWith('__NOTICE') || p.startsWith('... and') || (e as any).isNotice) {
-          capped = true;
-          return false;
-        }
-        return true;
+        return !p.startsWith('__NOTICE') && !p.startsWith('... and') && !(e as any).isNotice;
       });
-      setIsCappedNotice(capped);
 
       const items: ArchiveItem[] = validEntries.map((e) => ({
         fullPath: (e.path || e.name).replace(/\\/g, '/'),
         name: (e.path || e.name).replace(/\\/g, '/'),
         size: e.uncompressedSize || 0,
         isDirectory: e.isDirectory,
+        isEncrypted: (e as any).isEncrypted || false,
       }));
       setAllItems(items);
       if (password) setSavedPassword(password);
@@ -114,6 +143,8 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
         if (password) {
           setPasswordError('Incorrect password. Please try again.');
         }
+      } else if (msg.toLowerCase().includes('corrupt') || msg.toLowerCase().includes('damage')) {
+        setRecoveryState({ visible: true, type: 'DAMAGED' });
       } else {
         setErrorMsg(`Failed to list ZIP contents: ${msg}`);
       }
@@ -122,11 +153,18 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
     }
   };
 
-  // Build folder hierarchy for currentPath
+  const totalBytes = useMemo(() => {
+    return allItems.reduce((acc, cur) => acc + (cur.size || 0), 0);
+  }, [allItems]);
+
+  const lockedCount = useMemo(() => {
+    return allItems.filter((i) => i.isEncrypted).length;
+  }, [allItems]);
+
+  // Folder hierarchy for currentPath
   const visibleItems = useMemo(() => {
     const folders = new Map<string, ArchiveItem>();
     const files: ArchiveItem[] = [];
-
     const normCurrent = currentPath ? (currentPath.endsWith('/') ? currentPath : currentPath + '/') : '';
 
     for (const item of allItems) {
@@ -138,7 +176,6 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
 
       const slashIdx = rel.indexOf('/');
       if (slashIdx !== -1) {
-        // It's inside a subfolder
         const folderName = rel.substring(0, slashIdx);
         if (!folders.has(folderName)) {
           folders.set(folderName, {
@@ -149,7 +186,6 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
           });
         }
       } else {
-        // It's a file or empty folder directly in this directory
         if (item.isDirectory) {
           if (!folders.has(rel)) {
             folders.set(rel, {
@@ -165,6 +201,7 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
             name: rel,
             size: item.size,
             isDirectory: false,
+            isEncrypted: item.isEncrypted,
           });
         }
       }
@@ -177,6 +214,25 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
     if (!searchQuery.trim()) return combined;
     return combined.filter((i) => i.name.toLowerCase().includes(searchQuery.toLowerCase()));
   }, [allItems, currentPath, searchQuery]);
+
+  const formatSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const getFileBadge = (name: string, isDirectory: boolean) => {
+    if (isDirectory) return { label: 'DIR', bg: '#EFF6FF', text: FigmaTheme.colors.primary };
+    const ext = name.split('.').pop()?.toLowerCase() || '';
+    if (ext === 'pdf') return FigmaTheme.badges.pdf;
+    if (['xlsx', 'xls', 'csv'].includes(ext)) return FigmaTheme.badges.excel;
+    if (['docx', 'doc'].includes(ext)) return FigmaTheme.badges.word;
+    if (['pptx', 'ppt'].includes(ext)) return FigmaTheme.badges.pptx;
+    if (['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) return FigmaTheme.badges.image;
+    if (['mp4', 'mkv', 'avi'].includes(ext)) return FigmaTheme.badges.video;
+    if (['mp3', 'wav', 'm4a'].includes(ext)) return FigmaTheme.badges.audio;
+    return FigmaTheme.badges.unknown;
+  };
 
   const handleNavigateFolder = (folder: ArchiveItem) => {
     setCurrentPath(folder.fullPath);
@@ -199,39 +255,44 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
     const ext = item.name.split('.').pop()?.toLowerCase() || '';
     if (ext === 'pdf') {
       setActiveViewer({ type: 'PDF', path: extractedPath, name: item.name });
-    } else if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'heic', 'heif'].includes(ext)) {
+    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic'].includes(ext)) {
       setActiveViewer({ type: 'IMAGE', path: extractedPath, name: item.name });
-    } else if (['mp4', 'mkv', 'webm', 'avi', 'mov'].includes(ext)) {
+    } else if (['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) {
       setActiveViewer({ type: 'VIDEO', path: extractedPath, name: item.name });
-    } else if (['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg'].includes(ext)) {
+    } else if (['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg'].includes(ext)) {
       setActiveViewer({ type: 'AUDIO', path: extractedPath, name: item.name });
+    } else if (['docx', 'doc'].includes(ext)) {
+      setActiveViewer({
+        type: 'OFFICE',
+        path: extractedPath,
+        name: item.name,
+        formatType: ext === 'doc' ? 'DOC' : 'DOCX',
+      });
+    } else if (['pptx', 'ppt'].includes(ext)) {
+      setActiveViewer({
+        type: 'OFFICE',
+        path: extractedPath,
+        name: item.name,
+        formatType: ext === 'ppt' ? 'PPT' : 'PPTX',
+      });
     } else if (['xlsx', 'xls'].includes(ext)) {
       setActiveViewer({ type: 'XLSX', path: extractedPath, name: item.name });
     } else if (['csv', 'tsv'].includes(ext)) {
       setActiveViewer({ type: 'CSV', path: extractedPath, name: item.name });
-    } else if (ext === 'docx') {
-      setActiveViewer({ type: 'OFFICE', path: extractedPath, name: item.name, formatType: 'DOCX' });
-    } else if (ext === 'pptx') {
-      setActiveViewer({ type: 'OFFICE', path: extractedPath, name: item.name, formatType: 'PPTX' });
     } else {
       setActiveViewer({ type: 'TEXT', path: extractedPath, name: item.name });
     }
   };
 
-  const handleFilePress = async (item: ArchiveItem, forcedPwd?: string) => {
+  const handleFilePress = async (item: ArchiveItem) => {
     if (item.isDirectory) {
       handleNavigateFolder(item);
       return;
     }
-    if (item.fullPath.startsWith('__NOTICE') || item.name.startsWith('...')) {
-      return; // Non-clickable notice
-    }
 
     setExtractingName(item.name);
-    setErrorMsg(null);
     try {
-      const pwd = forcedPwd !== undefined ? forcedPwd : savedPassword;
-      const extractedPath = await engine.extractSingleZip(filePath, item.fullPath, pwd || undefined);
+      const extractedPath = await engine.extractSingleZip(filePath, item.fullPath, savedPassword || undefined);
       extractedFilesRef.current.push(extractedPath);
       openViewerForFile(item, extractedPath);
     } catch (err: any) {
@@ -239,183 +300,367 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
       if (
         msg.toLowerCase().includes('password') ||
         msg.toLowerCase().includes('encrypt') ||
-        msg.includes('PASSWORD_REQUIRED')
+        msg.toLowerCase().includes('aes')
       ) {
         setPendingFileItem(item);
         setIsPasswordModalVisible(true);
-        if (forcedPwd) {
-          setPasswordError('Incorrect password. Please try again.');
-        }
       } else {
-        setErrorMsg(`Failed to extract "${item.name}": ${msg}`);
+        setErrorMsg(`Failed to open "${item.name}": ${msg}`);
       }
     } finally {
       setExtractingName(null);
     }
   };
 
-  const getFileIcon = (name: string, isDir: boolean): string => {
-    if (isDir) return '📁';
-    const ext = name.split('.').pop()?.toLowerCase() || '';
-    switch (ext) {
-      case 'pdf': return '📕';
-      case 'jpg': case 'jpeg': case 'png': case 'webp': case 'bmp': case 'gif': return '🖼️';
-      case 'mp4': case 'mkv': case 'webm': case 'avi': return '🎬';
-      case 'mp3': case 'wav': case 'flac': case 'm4a': return '🎵';
-      case 'docx': case 'doc': return '📘';
-      case 'xlsx': case 'xls': return '📗';
-      case 'csv': case 'tsv': return '📊';
-      case 'pptx': case 'ppt': return '📙';
-      case 'zip': case 'rar': case '7z': return '🗜️';
-      default: return '📄';
+  // Selection toggle
+  const handleToggleSelect = (itemPath: string) => {
+    const updated = new Set(selectedPaths);
+    if (updated.has(itemPath)) {
+      updated.delete(itemPath);
+    } else {
+      updated.add(itemPath);
+    }
+    setSelectedPaths(updated);
+  };
+
+  const handleSelectAll = () => {
+    if (selectedPaths.size === visibleItems.length) {
+      setSelectedPaths(new Set());
+    } else {
+      setSelectedPaths(new Set(visibleItems.map((i) => i.fullPath)));
     }
   };
 
-  const formatSize = (bytes: number): string => {
-    if (!bytes) return '0 B';
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  // Execute extraction process (Figma Image 4)
+  const handleStartExtraction = async (options: {
+    mode: 'ALL' | 'SELECTED';
+    keepFolderStructure: boolean;
+    conflictResolution: 'SKIP' | 'REPLACE' | 'KEEP_BOTH';
+  }) => {
+    const itemsToExtract =
+      options.mode === 'SELECTED'
+        ? allItems.filter((i) => selectedPaths.has(i.fullPath) && !i.isDirectory)
+        : allItems.filter((i) => !i.isDirectory);
+
+    if (itemsToExtract.length === 0) return;
+
+    setIsExtractionProgressVisible(true);
+    setExtractionProgress({ current: 0, total: itemsToExtract.length, file: '', percent: 0 });
+
+    const failed: Array<{ name: string; reason: string }> = [];
+    let successCount = 0;
+
+    for (let i = 0; i < itemsToExtract.length; i++) {
+      const item = itemsToExtract[i];
+      const percent = ((i + 1) / itemsToExtract.length) * 100;
+      setExtractionProgress({
+        current: i + 1,
+        total: itemsToExtract.length,
+        file: item.name,
+        percent,
+      });
+
+      try {
+        await engine.extractSingleZip(filePath, item.fullPath, savedPassword || undefined);
+        successCount++;
+      } catch (err: any) {
+        failed.push({
+          name: item.name,
+          reason: item.isEncrypted ? 'Needs a password' : 'Damaged entry',
+        });
+      }
+    }
+
+    setIsExtractionProgressVisible(false);
+    setExtractionResult({
+      successCount,
+      totalCount: itemsToExtract.length,
+      dest: defaultDownloadDest,
+      failed,
+    });
+    setIsExtractionResultVisible(true);
   };
 
-  const handleShare = async () => {
-    try {
-      await engine.shareFile(filePath, 'application/zip');
-    } catch (err) {
-      console.warn('Share error', err);
+  // Breadcrumbs segments
+  const breadcrumbSegments = useMemo(() => {
+    const segments: Array<{ label: string; fullPath: string }> = [
+      { label: fileName, fullPath: '' },
+    ];
+    if (currentPath) {
+      const parts = currentPath.split('/').filter(Boolean);
+      let accumulated = '';
+      for (const part of parts) {
+        accumulated += `${part}/`;
+        segments.push({ label: part, fullPath: accumulated });
+      }
     }
-  };
+    return segments;
+  }, [currentPath, fileName]);
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#1e293b" />
+      <StatusBar hidden={true} />
 
-      {/* Header */}
+      {/* 1. TOP HEADER (#016EEF) */}
       <View style={styles.header}>
-        <View style={styles.headerLeft}>
-          <Text style={styles.title} numberOfLines={1}>
-            🗜️ {fileName}
+        <TouchableOpacity style={styles.backBtn} onPress={onClose} activeOpacity={0.7}>
+          <Text style={styles.backBtnText}>←</Text>
+        </TouchableOpacity>
+
+        <View style={styles.headerTitleBox}>
+          <Text style={styles.headerTitleText} numberOfLines={1}>
+            {fileName}
           </Text>
-          <Text style={styles.subtitle}>
-            {allItems.length} files • ZIP Archive Browser
+          <Text style={styles.headerSubText}>
+            ZIP archive • {allItems.length} items
           </Text>
         </View>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <TouchableOpacity style={styles.shareBtn} onPress={handleShare} activeOpacity={0.7}>
-            <Text style={styles.shareBtnText}>📤 Share</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.closeBtn} onPress={onClose}>
-            <Text style={styles.closeBtnText}>✕ Close</Text>
-          </TouchableOpacity>
-        </View>
+
+        <TouchableOpacity style={styles.headerActionBtn} activeOpacity={0.7}>
+          <Text style={styles.headerActionText}>⋮</Text>
+        </TouchableOpacity>
       </View>
 
-      {/* Breadcrumbs & Navigation Bar */}
-      <View style={styles.navBar}>
-        {currentPath ? (
-          <TouchableOpacity style={styles.upBtn} onPress={handleNavigateUp}>
-            <Text style={styles.upBtnText}>⬆️ Up</Text>
+      {/* 2. BREADCRUMBS BAR (Figma Image 3) */}
+      {currentPath.length > 0 && (
+        <View style={styles.breadcrumbsBar}>
+          <TouchableOpacity onPress={() => setCurrentPath('')} activeOpacity={0.7}>
+            <Text style={styles.breadcrumbLink}>{fileName}</Text>
           </TouchableOpacity>
-        ) : null}
-
-        <Text style={styles.breadcrumbText} numberOfLines={1}>
-          📁 /{currentPath}
-        </Text>
-      </View>
-
-      {/* Search Input */}
-      <View style={styles.searchBar}>
-        <Text style={styles.searchIcon}>🔍</Text>
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Filter files in this folder..."
-          placeholderTextColor="#94a3b8"
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-        />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity onPress={() => setSearchQuery('')}>
-            <Text style={styles.clearSearch}>✕</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-
-      {/* Content */}
-      {isLoading ? (
-        <View style={styles.centerBox}>
-          <ActivityIndicator size="large" color="#0284c7" />
-          <Text style={styles.loadingText}>Reading ZIP Archive...</Text>
+          {breadcrumbSegments.slice(1).map((seg, idx, arr) => {
+            const isLast = idx === arr.length - 1;
+            return (
+              <React.Fragment key={seg.fullPath}>
+                <Text style={styles.breadcrumbSep}>&gt;</Text>
+                <TouchableOpacity
+                  onPress={() => setCurrentPath(seg.fullPath)}
+                  disabled={isLast}
+                  activeOpacity={0.7}>
+                  <Text style={[styles.breadcrumbLink, isLast && styles.breadcrumbActive]}>
+                    {seg.label}
+                  </Text>
+                </TouchableOpacity>
+              </React.Fragment>
+            );
+          })}
         </View>
-      ) : errorMsg ? (
-        <View style={styles.centerBox}>
-          <View style={styles.errorCard}>
-            <Text style={styles.errorIcon}>⚠️</Text>
-            <Text style={styles.errorTitle}>Archive Error</Text>
-            <Text style={styles.errorDesc}>{errorMsg}</Text>
-          </View>
-        </View>
-      ) : (
-        <>
-          {isCappedNotice && (
-            <View style={{ backgroundColor: '#fef3c7', paddingHorizontal: 16, paddingVertical: 8, flexDirection: 'row', alignItems: 'center' }}>
-              <Text style={{ fontSize: 13, color: '#92400e', fontWeight: '500' }}>
-                ℹ️ Showing first 2,500 files (safety cap for optimal speed)
-              </Text>
-            </View>
-          )}
-          {visibleItems.length === 0 ? (
-            <View style={styles.centerBox}>
-              <Text style={styles.emptyIcon}>📂</Text>
-              <Text style={styles.emptyTitle}>Folder is Empty</Text>
-            </View>
-          ) : (
-            <FlatList
-              data={visibleItems}
-              keyExtractor={(item) => item.fullPath}
-              contentContainerStyle={styles.listContent}
-              renderItem={({ item }) => {
-                const isExtractingThis = extractingName === item.name;
-                return (
-                  <TouchableOpacity
-                    style={styles.fileCard}
-                    onPress={() => handleFilePress(item)}
-                    disabled={extractingName !== null}
-                    activeOpacity={0.7}>
-                    <View style={styles.iconBox}>
-                      <Text style={styles.fileIcon}>
-                        {getFileIcon(item.name, item.isDirectory)}
-                      </Text>
-                    </View>
-
-                    <View style={styles.fileInfo}>
-                      <Text style={styles.fileName} numberOfLines={1}>
-                        {item.name}
-                      </Text>
-                      <Text style={styles.fileMeta}>
-                        {item.isDirectory ? 'Folder • Tap to open' : formatSize(item.size)}
-                      </Text>
-                    </View>
-
-                    <View style={styles.rightAction}>
-                      {isExtractingThis ? (
-                        <ActivityIndicator color="#0284c7" size="small" />
-                      ) : item.isDirectory ? (
-                        <Text style={styles.chevron}>›</Text>
-                      ) : (
-                        <Text style={styles.viewBadge}>Open</Text>
-                      )}
-                    </View>
-                  </TouchableOpacity>
-                );
-              }}
-            />
-          )}
-        </>
       )}
 
-      {/* Sub-Viewer Fullscreen Overlay */}
+      {/* 3. ARCHIVE OVERVIEW CARD (Figma Image 3) */}
+      {!currentPath && (
+        <View style={styles.archiveOverviewCard}>
+          <View style={styles.overviewBadge}>
+            <Text style={styles.overviewBadgeText}>ZIP</Text>
+          </View>
+          <View style={styles.overviewInfo}>
+            <Text style={styles.overviewTitle}>ZIP archive</Text>
+            <Text style={styles.overviewMeta}>
+              {allItems.length} items • {formatSize(totalBytes)}
+            </Text>
+          </View>
+          {lockedCount > 0 && (
+            <View style={styles.lockedPill}>
+              <Text style={styles.lockedPillText}>🔒 {lockedCount} locked</Text>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* 4. SELECTION / COUNT BAR (Figma Image 3) */}
+      <View style={styles.countSelectionBar}>
+        <Text style={styles.countText}>
+          {selectedPaths.size > 0 ? `${selectedPaths.size} selected` : 'Contents'}
+        </Text>
+        <TouchableOpacity activeOpacity={0.7} onPress={handleSelectAll}>
+          <Text style={styles.selectAllText}>
+            {selectedPaths.size === visibleItems.length ? 'Deselect all' : 'Select all'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* 5. CONTENTS LIST (Figma Image 3) */}
+      {isLoading ? (
+        <View style={styles.centerStatusBox}>
+          <ActivityIndicator size="large" color={FigmaTheme.colors.primary} />
+          <Text style={styles.loadingText}>Reading archive contents...</Text>
+        </View>
+      ) : errorMsg ? (
+        <View style={styles.centerStatusBox}>
+          <Text style={styles.emptyIcon}>⚠️</Text>
+          <Text style={styles.emptyTitle}>Cannot open archive</Text>
+          <Text style={styles.emptySubtitle}>{errorMsg}</Text>
+          <TouchableOpacity style={styles.backToArchiveBtn} activeOpacity={0.8} onPress={() => loadContents()}>
+            <Text style={styles.backToArchiveBtnText}>Try again</Text>
+          </TouchableOpacity>
+        </View>
+      ) : visibleItems.length === 0 ? (
+        /* EMPTY FOLDER STATE (Figma Image 4) */
+        <View style={styles.emptyFolderBox}>
+          <Text style={styles.emptyIcon}>📁</Text>
+          <Text style={styles.emptyTitle}>This folder is empty</Text>
+          <Text style={styles.emptySubtitle}>There's nothing to extract here.</Text>
+          <TouchableOpacity style={styles.backToArchiveBtn} activeOpacity={0.8} onPress={handleNavigateUp}>
+            <Text style={styles.backToArchiveBtnText}>&lt; Back to archive</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <FlatList
+          data={visibleItems}
+          keyExtractor={(item) => item.fullPath}
+          contentContainerStyle={styles.listContent}
+          renderItem={({ item }) => {
+            const badge = getFileBadge(item.name, item.isDirectory);
+            const isSelected = selectedPaths.has(item.fullPath);
+            const isExtracting = extractingName === item.name;
+
+            return (
+              <View style={[styles.itemRow, isSelected && styles.itemRowSelected]}>
+                {/* Selection Checkbox */}
+                <TouchableOpacity
+                  style={styles.checkboxTouch}
+                  activeOpacity={0.7}
+                  onPress={() => handleToggleSelect(item.fullPath)}>
+                  <View style={[styles.checkboxBox, isSelected && styles.checkboxBoxSelected]}>
+                    {isSelected && <Text style={styles.checkboxCheck}>✓</Text>}
+                  </View>
+                </TouchableOpacity>
+
+                {/* File Row Body */}
+                <TouchableOpacity
+                  style={styles.itemRowBody}
+                  activeOpacity={0.7}
+                  onPress={() => handleFilePress(item)}>
+                  <View style={[styles.itemBadge, { backgroundColor: badge.bg }]}>
+                    <Text style={[styles.itemBadgeText, { color: badge.text }]}>{badge.label}</Text>
+                  </View>
+
+                  <View style={styles.itemMetaBox}>
+                    <Text style={styles.itemNameText} numberOfLines={1}>
+                      {item.name}
+                    </Text>
+                    <Text style={styles.itemSubText}>
+                      {item.isDirectory
+                        ? 'Folder'
+                        : `${formatSize(item.size)}${item.isEncrypted ? ' • Encrypted 🔒' : ''}`}
+                    </Text>
+                  </View>
+
+                  {isExtracting ? (
+                    <ActivityIndicator size="small" color={FigmaTheme.colors.primary} />
+                  ) : item.isDirectory ? (
+                    <Text style={styles.chevron}>&gt;</Text>
+                  ) : null}
+                </TouchableOpacity>
+              </View>
+            );
+          }}
+        />
+      )}
+
+      {/* 6. BOTTOM DOCKED BAR: [ Extract all | Extract selected ] (Figma Image 3) */}
+      <View style={styles.bottomBar}>
+        <TouchableOpacity
+          style={styles.extractAllBtn}
+          activeOpacity={0.8}
+          onPress={() => setIsExtractionOptionsVisible(true)}>
+          <Text style={styles.extractAllBtnText}>Extract all</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.extractSelectedBtn, selectedPaths.size === 0 && styles.extractSelectedBtnDisabled]}
+          disabled={selectedPaths.size === 0}
+          activeOpacity={0.8}
+          onPress={() => setIsExtractionOptionsVisible(true)}>
+          <Text style={styles.extractSelectedBtnText}>
+            Extract selected {selectedPaths.size > 0 ? `(${selectedPaths.size})` : ''}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* 7. EXTRACTION OPTIONS MODAL (Figma Image 4) */}
+      <ExtractionOptionsModal
+        visible={isExtractionOptionsVisible}
+        totalItemsCount={allItems.length}
+        totalSizeBytes={totalBytes}
+        selectedItemsCount={selectedPaths.size}
+        selectedSizeBytes={allItems
+          .filter((i) => selectedPaths.has(i.fullPath))
+          .reduce((a, c) => a + c.size, 0)}
+        destinationPath={defaultDownloadDest}
+        onClose={() => setIsExtractionOptionsVisible(false)}
+        onConfirmExtract={handleStartExtraction}
+      />
+
+      {/* 8. EXTRACTION PROGRESS MODAL (Figma Image 4) */}
+      <ExtractionProgressModal
+        visible={isExtractionProgressVisible}
+        currentCount={extractionProgress.current}
+        totalCount={extractionProgress.total}
+        currentFileName={extractionProgress.file}
+        progressPercent={extractionProgress.percent}
+        onCancel={() => setIsExtractionProgressVisible(false)}
+      />
+
+      {/* 9. EXTRACTION RESULT MODAL (Figma Image 4) */}
+      <ExtractionResultModal
+        visible={isExtractionResultVisible}
+        successCount={extractionResult.successCount}
+        totalCount={extractionResult.totalCount}
+        destinationPath={extractionResult.dest}
+        failedItems={extractionResult.failed}
+        onBrowseExtracted={() => setIsExtractionResultVisible(false)}
+        onOpenExtracted={() => setIsExtractionResultVisible(false)}
+        onClose={() => setIsExtractionResultVisible(false)}
+      />
+
+      {/* 10. ARCHIVE RECOVERY MODAL (Figma Image 5) */}
+      <ArchiveRecoveryModal
+        visible={recoveryState.visible}
+        type={recoveryState.type}
+        onRetry={() => {
+          setRecoveryState({ visible: false, type: 'DAMAGED' });
+          loadContents();
+        }}
+        onShare={() => engine.shareFile(filePath)}
+        onClose={() => setRecoveryState({ visible: false, type: 'DAMAGED' })}
+      />
+
+      {/* 11. PASSWORD MODAL */}
+      <PasswordModal
+        visible={isPasswordModalVisible}
+        fileName={pendingFileItem ? pendingFileItem.name : fileName}
+        errorMsg={passwordError}
+        isLoading={isLoading}
+        onUnlock={async (pwd) => {
+          setPasswordError(null);
+          setSavedPassword(pwd);
+          if (pendingFileItem) {
+            const item = pendingFileItem;
+            setExtractingName(item.name);
+            try {
+              const extractedPath = await engine.extractSingleZip(filePath, item.fullPath, pwd);
+              extractedFilesRef.current.push(extractedPath);
+              setIsPasswordModalVisible(false);
+              setPendingFileItem(null);
+              openViewerForFile(item, extractedPath);
+            } catch (err: any) {
+              setPasswordError('Incorrect password. Please try again.');
+            } finally {
+              setExtractingName(null);
+            }
+          } else {
+            loadContents(pwd);
+          }
+        }}
+        onCancel={() => {
+          setIsPasswordModalVisible(false);
+          setPendingFileItem(null);
+        }}
+      />
+
+      {/* 12. SUB-VIEWER MODAL */}
       {activeViewer && (
-        <View style={[StyleSheet.absoluteFill, { backgroundColor: '#ffffff', zIndex: 100 }]}>
+        <View style={[StyleSheet.absoluteFill, { backgroundColor: '#FFFFFF', zIndex: 100 }]}>
           {activeViewer.type === 'PDF' && (
             <PdfViewer
               filePath={activeViewer.path}
@@ -469,47 +714,6 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
           )}
         </View>
       )}
-
-      {/* Password Modal */}
-      <PasswordModal
-        visible={isPasswordModalVisible}
-        fileName={pendingFileItem ? pendingFileItem.name : fileName}
-        errorMsg={passwordError}
-        isLoading={isLoading || !!extractingName}
-        onUnlock={async (pwd) => {
-          setPasswordError(null);
-          setSavedPassword(pwd);
-          if (pendingFileItem) {
-            const item = pendingFileItem;
-            setExtractingName(item.name);
-            try {
-              const extractedPath = await engine.extractSingleZip(filePath, item.fullPath, pwd);
-              extractedFilesRef.current.push(extractedPath);
-              setIsPasswordModalVisible(false);
-              setPendingFileItem(null);
-              openViewerForFile(item, extractedPath);
-            } catch (err: any) {
-              const msg = err.message || String(err);
-              setPasswordError(
-                msg.toLowerCase().includes('password') || msg.toLowerCase().includes('encrypt')
-                  ? 'Incorrect password. Please try again.'
-                  : `Extraction failed: ${msg}`
-              );
-            } finally {
-              setExtractingName(null);
-            }
-          } else {
-            await loadContents(pwd);
-          }
-        }}
-        onCancel={() => {
-          setIsPasswordModalVisible(false);
-          setPendingFileItem(null);
-          if (allItems.length === 0) {
-            onClose();
-          }
-        }}
-      />
     </SafeAreaView>
   );
 };
@@ -517,206 +721,311 @@ export const ZipViewerScreen: React.FC<ZipViewerProps> = ({
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8fafc',
+    backgroundColor: FigmaTheme.colors.background,
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: '#1e293b',
     paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingVertical: 12,
+    backgroundColor: FigmaTheme.colors.headerBlue,
   },
-  headerLeft: {
-    flex: 1,
-    marginRight: 8,
-  },
-  title: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#ffffff',
-  },
-  subtitle: {
-    fontSize: 11,
-    color: '#94a3b8',
-    marginTop: 2,
-  },
-  shareBtn: {
-    backgroundColor: '#334155',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  shareBtnText: {
-    color: '#38bdf8',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  closeBtn: {
-    backgroundColor: '#334155',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  closeBtnText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  navBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#0f172a',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    gap: 8,
-  },
-  upBtn: {
-    backgroundColor: '#334155',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 4,
-  },
-  upBtnText: {
-    color: '#ffffff',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  breadcrumbText: {
-    flex: 1,
-    fontSize: 12,
-    color: '#38bdf8',
-    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier',
-  },
-  searchBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#ffffff',
-    marginHorizontal: 12,
-    marginTop: 10,
-    marginBottom: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  searchIcon: {
-    fontSize: 14,
-    marginRight: 6,
-  },
-  searchInput: {
-    flex: 1,
-    fontSize: 13,
-    color: '#0f172a',
-    paddingVertical: 0,
-  },
-  clearSearch: {
-    fontSize: 14,
-    color: '#64748b',
-    paddingHorizontal: 4,
-  },
-  listContent: {
-    padding: 12,
-  },
-  fileCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#ffffff',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  iconBox: {
-    width: 38,
-    height: 38,
-    borderRadius: 8,
-    backgroundColor: '#f1f5f9',
+  backBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
     justifyContent: 'center',
     alignItems: 'center',
     marginRight: 10,
   },
-  fileIcon: {
+  backBtnText: {
     fontSize: 20,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
-  fileInfo: {
+  headerTitleBox: {
+    flex: 1,
+    marginRight: 10,
+  },
+  headerTitleText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  headerSubText: {
+    fontSize: 11,
+    color: 'rgba(255, 255, 255, 0.85)',
+    marginTop: 2,
+  },
+  headerActionBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerActionText: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+
+  breadcrumbsBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    backgroundColor: '#FFFFFF',
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+    gap: 6,
+  },
+  breadcrumbLink: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: FigmaTheme.colors.primary,
+  },
+  breadcrumbActive: {
+    color: '#0F172A',
+    fontWeight: '700',
+  },
+  breadcrumbSep: {
+    fontSize: 11,
+    color: '#94A3B8',
+  },
+
+  archiveOverviewCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+  },
+  overviewBadge: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#FEF3C7',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  overviewBadgeText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#D97706',
+  },
+  overviewInfo: {
+    flex: 1,
+  },
+  overviewTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#0F172A',
+    marginBottom: 2,
+  },
+  overviewMeta: {
+    fontSize: 12,
+    color: '#64748B',
+  },
+  lockedPill: {
+    backgroundColor: '#FEF2F2',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  lockedPillText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#DC2626',
+  },
+
+  countSelectionBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  countText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#64748B',
+  },
+  selectAllText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: FigmaTheme.colors.primary,
+  },
+
+  listContent: {
+    paddingHorizontal: 16,
+    paddingBottom: 100,
+  },
+  itemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    ...FigmaTheme.shadows.card,
+  },
+  itemRowSelected: {
+    backgroundColor: '#EFF6FF',
+    borderColor: FigmaTheme.colors.primary,
+  },
+  checkboxTouch: {
+    paddingRight: 10,
+  },
+  checkboxBox: {
+    width: 20,
+    height: 20,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    borderColor: '#CBD5E1',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  checkboxBoxSelected: {
+    backgroundColor: FigmaTheme.colors.primary,
+    borderColor: FigmaTheme.colors.primary,
+  },
+  checkboxCheck: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+  itemRowBody: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  itemBadge: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 10,
+  },
+  itemBadgeText: {
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  itemMetaBox: {
     flex: 1,
     marginRight: 8,
   },
-  fileName: {
+  itemNameText: {
     fontSize: 13,
-    fontWeight: '600',
-    color: '#0f172a',
-  },
-  fileMeta: {
-    fontSize: 11,
-    color: '#64748b',
-    marginTop: 2,
-  },
-  rightAction: {
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  viewBadge: {
-    fontSize: 11,
-    color: '#0284c7',
     fontWeight: '700',
-    backgroundColor: '#e0f2fe',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
+    color: '#0F172A',
+    marginBottom: 2,
+  },
+  itemSubText: {
+    fontSize: 11,
+    color: '#64748B',
   },
   chevron: {
-    fontSize: 18,
-    color: '#94a3b8',
+    fontSize: 14,
     fontWeight: '700',
+    color: '#94A3B8',
   },
-  centerBox: {
+
+  // Bottom Action Bar
+  bottomBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: 1,
+    borderTopColor: '#E2E8F0',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    gap: 12,
+    ...FigmaTheme.shadows.floating,
+  },
+  extractAllBtn: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: FigmaTheme.colors.primary,
+    borderRadius: 14,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  extractAllBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: FigmaTheme.colors.primary,
+  },
+  extractSelectedBtn: {
+    flex: 1,
+    backgroundColor: FigmaTheme.colors.primary,
+    borderRadius: 14,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  extractSelectedBtnDisabled: {
+    opacity: 0.5,
+  },
+  extractSelectedBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+
+  centerStatusBox: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 24,
+    gap: 12,
   },
   loadingText: {
-    marginTop: 12,
-    fontSize: 14,
-    color: '#475569',
+    fontSize: 13,
+    color: '#64748B',
+  },
+
+  emptyFolderBox: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 30,
   },
   emptyIcon: {
-    fontSize: 40,
-    marginBottom: 8,
+    fontSize: 48,
+    marginBottom: 10,
+    opacity: 0.6,
   },
   emptyTitle: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#64748b',
-  },
-  errorCard: {
-    backgroundColor: '#fef2f2',
-    borderWidth: 1,
-    borderColor: '#fca5a5',
-    borderRadius: 12,
-    padding: 20,
-    alignItems: 'center',
-    maxWidth: 320,
-  },
-  errorIcon: {
-    fontSize: 32,
-    marginBottom: 8,
-  },
-  errorTitle: {
     fontSize: 16,
-    fontWeight: '700',
-    color: '#b91c1c',
-    marginBottom: 6,
+    fontWeight: '800',
+    color: '#0F172A',
+    marginBottom: 4,
   },
-  errorDesc: {
-    fontSize: 12,
-    color: '#7f1d1d',
-    textAlign: 'center',
-    lineHeight: 18,
+  emptySubtitle: {
+    fontSize: 13,
+    color: '#64748B',
+    marginBottom: 20,
+  },
+  backToArchiveBtn: {
+    backgroundColor: FigmaTheme.colors.primary,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  backToArchiveBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
 });

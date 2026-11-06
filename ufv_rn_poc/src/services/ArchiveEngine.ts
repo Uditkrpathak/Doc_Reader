@@ -364,6 +364,32 @@ export class ArchiveEngine {
     return await ArchiveModule.playVideo(filePath, autoSeek);
   }
 
+  public async probeMediaCodec(filePath: string): Promise<{
+    hasVideo: boolean;
+    hasAudio: boolean;
+    isVideoSupported: boolean;
+    isAudioSupported: boolean;
+    isSupported: boolean;
+    videoCodec: string;
+    audioCodec: string;
+    durationMs: number;
+    error?: string;
+  }> {
+    if (Platform.OS === 'android' && ArchiveModule?.probeMediaCodec) {
+      return await ArchiveModule.probeMediaCodec(filePath);
+    }
+    return {
+      hasVideo: false,
+      hasAudio: false,
+      isVideoSupported: true,
+      isAudioSupported: true,
+      isSupported: true,
+      videoCodec: '',
+      audioCodec: '',
+      durationMs: 0,
+    };
+  }
+
   // Native Audio Playback Engine (MP3, WAV, AAC, M4A, FLAC, OGG)
   public async startAudio(filePath: string): Promise<{ durationMs: number; currentPositionMs: number; isPlaying: boolean }> {
     if (Platform.OS === 'android' && ArchiveModule?.startAudio) {
@@ -400,6 +426,20 @@ export class ArchiveEngine {
     return false;
   }
 
+  public async setAudioSpeed(speed: number): Promise<boolean> {
+    if (Platform.OS === 'android' && ArchiveModule?.setAudioSpeed) {
+      return await ArchiveModule.setAudioSpeed(speed);
+    }
+    return false;
+  }
+
+  public async setImmersiveMode(enabled: boolean): Promise<boolean> {
+    if (Platform.OS === 'android' && ArchiveModule?.setImmersiveMode) {
+      return await ArchiveModule.setImmersiveMode(enabled);
+    }
+    return false;
+  }
+
   public async getAudioStatus(): Promise<{ durationMs: number; currentPositionMs: number; isPlaying: boolean }> {
     if (Platform.OS === 'android' && ArchiveModule?.getAudioStatus) {
       return await ArchiveModule.getAudioStatus();
@@ -407,11 +447,24 @@ export class ArchiveEngine {
     return { durationMs: 0, currentPositionMs: 0, isPlaying: false };
   }
 
-  public async shareFile(filePath: string, mimeType?: string): Promise<boolean> {
-    if (Platform.OS === 'android' && ArchiveModule?.shareFile) {
-      return await ArchiveModule.shareFile(filePath, mimeType || '*/*');
+  public async shareFiles(filePaths: string[], mimeType?: string): Promise<boolean> {
+    if (Platform.OS === 'android') {
+      if (!filePaths || filePaths.length === 0) return false;
+      if (filePaths.length === 1 && ArchiveModule?.shareFile) {
+        return await ArchiveModule.shareFile(filePaths[0], mimeType || '*/*');
+      }
+      if (ArchiveModule?.shareMultipleFiles) {
+        return await ArchiveModule.shareMultipleFiles(filePaths, mimeType || '*/*');
+      }
+      if (ArchiveModule?.shareFile) {
+        return await ArchiveModule.shareFile(filePaths[0], mimeType || '*/*');
+      }
     }
     return false;
+  }
+
+  public async shareFile(filePath: string, mimeType?: string): Promise<boolean> {
+    return this.shareFiles([filePath], mimeType);
   }
 
   public async getInitialSharedFile(): Promise<{ uri: string; action: string; mimeType?: string } | null> {
